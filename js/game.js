@@ -302,7 +302,7 @@ async function loadCriticalAssets() {
                    'btn_shoot','btn_left','btn_right','btn_jump','restart_btn'];
     const files  = ['coin.png','bullet.png','banner_win.png','banner_lose.png','btn_retry.png',
                     'btn_shoot.png','btn_left.png','btn_right.png','btn_Jumping.png','Restart_button.png'];
-    proms.push(loadImg('assets/buttons/' + files[i]).then(img => { UI_IMGS[keys2[i]] = img; }));
+    proms.push(loadImg('assets/ui/' + files[i]).then(img => { UI_IMGS[keys2[i]] = img; }));
   });
 
   // ديكور العالم 1
@@ -353,9 +353,8 @@ async function loadCriticalAssets() {
     items.forEach(o => proms.push(loadImg(`assets/objects/${world}/${o}`).then(img => { OBJ_IMGS[world][o] = img; })));
   }
 
-  // انتظر حتى يكتمل كل شيء (أو 20 ثانية كحد أقصى)
-  const timeout = new Promise(res => setTimeout(res, 20000));
-  await Promise.race([Promise.all(proms), timeout]);
+  // انتظر حتى يكتمل كل شيء
+  await Promise.all(proms);
 }
 
 // ── التحميل في الخلفية (فارغة - كل شيء يُحمَّل في Critical الآن) ──
@@ -2557,7 +2556,7 @@ window.addEventListener('load', async () => {
   showScreen('splash');
   setSplashBG();
 
-  setTimeout(() => loadRemainingAssets(), 2000);
+  // loadRemainingAssets removed - all loaded upfront
 });
 
 function ldProgress(p, txt) {
