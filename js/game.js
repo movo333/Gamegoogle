@@ -2341,9 +2341,9 @@ function resumeGame() {
 }
 
 // ── SHOP ──
-function openShop_disabled() {
+function openShop() {
   shopFrom = document.querySelector('.screen.active')?.id || 'splash';
-  showScreen('splash');
+  showScreen('shopScreen');
 }
 function closeShop() {
   // إذا فتح المتجر من شاشة الخسارة، تحقق هل لديه ما يكفي للإحياء
@@ -2361,7 +2361,7 @@ function closeShop() {
 // ══════════════════════════════════════════════════════
 let _lbCurrentTab = 'level';
 
-function showLeaderboard_disabled() {
+function showLeaderboard() {
   const el = document.getElementById('leaderboardScreen');
   if (el) el.classList.add('active');
   _lbCurrentTab = 'level';
