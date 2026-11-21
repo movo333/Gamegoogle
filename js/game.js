@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════
-//  SUPER PIO - Game Engine
+//  SUPER COWBOY - Game Engine
 //  Orientation: PORTRAIT device, LANDSCAPE game rotated 90°
 //  Player runs RIGHT → progress toward goal
 //  Ground = bottom 30% of game canvas
@@ -19,6 +19,7 @@ const T = { AIR:0,GND:1,PLT:2,COIN:3,WALKER:4,FLYER:5,AMMO:6,GOAL:7,SPIKE:8,BREA
 
 // ── SUPABASE CONFIG (Cloud Save) ──
 const SUPA_URL = 'https://xwkosqpxfihgprfququw.supabase.co';
+
 const SUPA_KEY = 'sb_publishable_TA1liFGVpi9Sw1HoTJz24Q_lg_3XvHv';
 
 // ── AUDIO SYSTEM ──
@@ -108,21 +109,24 @@ const SFX = (() => {
     } catch(e) { return false; }
   }
 
-  // Pool بسيط كـ fallback
+  // Pool بسيط كـ fallback (يُنشأ عند أول استخدام فقط)
   const POOL = 3;
   const pools = {};
-  Object.entries(MAP).forEach(([k, f]) => {
-    const arr = [];
-    for (let i = 0; i < POOL; i++) {
-      const a = new Audio(BASE + f);
-      a.preload = 'auto';
-      arr.push(a);
+  function getPool(name) {
+    if (!pools[name] && MAP[name]) {
+      const arr = [];
+      for (let i = 0; i < POOL; i++) {
+        const a = new Audio(BASE + MAP[name]);
+        a.preload = 'none';
+        arr.push(a);
+      }
+      pools[name] = { arr, i: 0 };
     }
-    pools[k] = { arr, i: 0 };
-  });
+    return pools[name];
+  }
 
   function playPool(name, vol) {
-    const p = pools[name];
+    const p = getPool(name);
     if (!p) return;
     const a = p.arr[p.i];
     p.i = (p.i + 1) % POOL;
@@ -131,14 +135,36 @@ const SFX = (() => {
     a.play().catch(() => {});
   }
 
+  function stopAll() {
+    // إيقاف كل الأصوات فوراً
+    Object.values(pools).forEach(p =>
+      p.arr.forEach(a => { try { a.pause(); a.currentTime = 0; } catch(e){} })
+    );
+    if (_ac) {
+      try { _ac.suspend(); } catch(e){}
+    }
+  }
+
   return {
     play(name, vol) {
       if (muted || !MAP[name]) return;
-      // حاول AudioContext أولاً، ثم pool
       if (!playAC(name, vol)) playPool(name, vol);
     },
+    stopAll,
     mute(v)   { muted = v; },
     isMuted() { return muted; },
+    urls() { return Object.values(MAP).map(f => BASE + f); },
+    // تحميل كل الأصوات قبل بدء اللعبة (مع مهلة لكل ملف)
+    preloadAll() {
+      const names = Object.keys(MAP);
+      return Promise.all(names.map(n => new Promise(res => {
+        loadBuffer(n);
+        const t0 = Date.now();
+        const iv = setInterval(() => {
+          if (acBuffers[n] || Date.now() - t0 > 15000) { clearInterval(iv); res(); }
+        }, 100);
+      })));
+    },
     unlock()  {
       // تحميل كل الأصوات في AudioContext بعد أول تفاعل
       Object.keys(MAP).forEach(n => loadBuffer(n));
@@ -152,7 +178,6 @@ const SFX = (() => {
 
 // ── GAME STATE ──
 const GS = {
-  user: null,          // Google user
   piUser: null,
   curLevel: 1,
   maxUnlocked: 1,  lives: 3,
@@ -197,8 +222,6 @@ const TILE_IMGS = {};  // TILE_IMGS['nature'][1] = Image
 const OBJ_IMGS  = {};  // OBJ_IMGS['nature']['Tree_1.png'] = Image
 const UI_IMGS   = {};  // UI_IMGS.splash = Image
 let allLoaded = false;
-let loadedCount = 0;
-let totalToLoad = 0;
 
 // ── SETUP ROTATION (portrait device → landscape game) ──
 function setupRotation() {
@@ -229,138 +252,6 @@ function setupRotation() {
   wrapper.style.transform = 'rotate(90deg)';
 }
 
-// ── IMAGE LOADER (نسختان: حرجة وخلفية) ──
-function loadImg(src) {
-  totalToLoad++;
-  return new Promise(res => {
-    const img = new Image();
-    img.onload  = () => { loadedCount++; updateLoadBar(); res(img); };
-    img.onerror = () => { loadedCount++; updateLoadBar(); res(null); };
-    img.src = src;
-  });
-}
-
-// تحميل صامت في الخلفية (لا يؤثر على شريط التحميل)
-function loadImgBg(src) {
-  return new Promise(res => {
-    const img = new Image();
-    img.onload  = () => res(img);
-    img.onerror = () => res(null);
-    img.src = src;
-  });
-}
-
-function updateLoadBar() {
-  const pct = totalToLoad > 0 ? Math.round(loadedCount / totalToLoad * 100) : 100;
-  const bar = document.getElementById('ldBar');
-  const txt = document.getElementById('ldTxt');
-  if (bar) bar.style.width = pct + '%';
-  if (txt) txt.textContent = `Loading... ${pct}%`;
-}
-
-// ── التحميل الحرج (العالم 1 فقط = يظهر في شريط التحميل) ──
-async function loadCriticalAssets() {
-  const proms = [];
-
-  // حساب إجمالي الأصول مسبقاً لشريط التحميل الدقيق
-  // شخصية: 41، أعداء: 13، بلاطات: 68+4، خلفيات: 4، UI: 7، أزرار: 10، ديكور: ~35
-  totalToLoad = 41 + 13 + 72 + 4 + 7 + 10 + 35;
-
-  // شخصية اللاعب
-  const anims = { idle:10, run:8, jump:10, dead:10, shoot:3 };
-  for (const [anim, count] of Object.entries(anims)) {
-    SPR[anim] = [];
-    for (let i = 1; i <= count; i++) {
-      proms.push(loadImg(`assets/character/${anim}${i}.png`).then(img => { SPR[anim][i-1] = img; }));
-    }
-  }
-
-  // أعداء العالم 1 فقط: snail1, bat1, tuca1
-  ['snail1','bat1','tuca1'].forEach(e =>
-    proms.push(loadImg(`assets/enemies/${e}.png`).then(img => { SPR[e] = img; }))
-  );
-
-  // صور بلاطات العالم 1 (nature) فقط
-  TILE_IMGS['nature'] = {};
-  for (let i = 1; i <= 18; i++) {
-    proms.push(loadImg(`assets/tiles/nature/${i}.png`).then(img => { TILE_IMGS['nature'][i] = img; }));
-  }
-
-  // خلفية العالم 1 + UI أساسية
-  proms.push(loadImg('assets/bg/nature_bg.png').then(img => { UI_IMGS.bg_nature = img; }));
-  proms.push(loadImg('assets/ui/splash_screen.png').then(img => { UI_IMGS.splash = img; }));
-  proms.push(loadImg('assets/ui/sky_bg.png').then(img => { UI_IMGS.sky_bg = img; }));
-  proms.push(loadImg('assets/ui/world_nature.png').then(img => { UI_IMGS.world_nature = img; }));
-  proms.push(loadImg('assets/ui/world_graveyard.png').then(img => { UI_IMGS.world_graveyard = img; }));
-  proms.push(loadImg('assets/ui/world_winter.png').then(img => { UI_IMGS.world_winter = img; }));
-  proms.push(loadImg('assets/ui/world_desert.png').then(img => { UI_IMGS.world_desert = img; }));
-
-  // أزرار التحكم الأساسية
-  ['coin','bullet','banner_win','banner_lose','btn_retry','btn_shoot',
-   'btn_left','btn_right','btn_Jumping','Restart_button'].forEach((f,i) => {
-    const keys2 = ['coin','bullet','banner_win','banner_lose','btn_retry',
-                   'btn_shoot','btn_left','btn_right','btn_jump','restart_btn'];
-    const files  = ['coin.png','bullet.png','banner_win.png','banner_lose.png','btn_retry.png',
-                    'btn_shoot.png','btn_left.png','btn_right.png','btn_Jumping.png','Restart_button.png'];
-    proms.push(loadImg('assets/ui/' + files[i]).then(img => { UI_IMGS[keys2[i]] = img; }));
-  });
-
-  // ديكور العالم 1
-  OBJ_IMGS['nature'] = {};
-  const nat = ['Tree_1.png','Tree_2.png','Tree_3.png','Bush__1_.png','Bush__2_.png',
-               'Bush__3_.png','Mushroom_1.png','Mushroom_2.png','Stone.png','Crate.png'];
-  nat.forEach(o => proms.push(loadImg(`assets/objects/nature/${o}`).then(img => { OBJ_IMGS['nature'][o] = img; })));
-
-  // ── تحميل كل العوالم كاملاً قبل الفتح ──
-
-  // أعداء العوالم 2-4
-  ['bat2','bat3','snail2','snail3',
-   'spikebee1','spikebee2','spikebee3','spikebee4',
-   'tuca2','tuca3'].forEach(e =>
-    proms.push(loadImg(`assets/enemies/${e}.png`).then(img => { SPR[e] = img; }))
-  );
-
-  // بلاطات العوالم 2-4
-  const rest = {
-    graveyard: 16,
-    winter:    18,
-    desert:    16,
-  };
-  for (const [world, count] of Object.entries(rest)) {
-    TILE_IMGS[world] = {};
-    for (let i = 1; i <= count; i++) {
-      proms.push(loadImg(`assets/tiles/${world}/${i}.png`).then(img => { TILE_IMGS[world][i] = img; }));
-    }
-  }
-  // عظام المقبرة
-  for (let b = 1; b <= 4; b++) {
-    proms.push(loadImg(`assets/tiles/graveyard/bone${b}.png`).then(img => { TILE_IMGS['graveyard']['bone'+b] = img; }));
-  }
-
-  // خلفيات العوالم 2-4
-  ['graveyard','winter','desert'].forEach(w => {
-    proms.push(loadImg(`assets/bg/${w}_bg.png`).then(img => { UI_IMGS['bg_'+w] = img; }));
-  });
-
-  // ديكور العوالم 2-4
-  const decoSets = {
-    graveyard: ['Tree.png','Dead_Tree.png','TombStone__1_.png','TombStone__2_.png','TombStone__3_.png','DeadBush.png','Crate.png','Bone.png','Skull.png','Candle.png'],
-    winter:    ['Tree_1.png','Tree_2.png','Tree_3.png','SnowMan.png','Stone.png','IceBox.png','IcePillar.png','Snowflake.png'],
-    desert:    ['Tree.png','Dead_Tree.png','Bush__1_.png','Bush__2_.png','Stone.png','Stone_2.png','Crate.png'],
-  };
-  for (const [world, items] of Object.entries(decoSets)) {
-    OBJ_IMGS[world] = {};
-    items.forEach(o => proms.push(loadImg(`assets/objects/${world}/${o}`).then(img => { OBJ_IMGS[world][o] = img; })));
-  }
-
-  // انتظر حتى يكتمل كل شيء
-  await Promise.all(proms);
-}
-
-// ── التحميل في الخلفية (فارغة - كل شيء يُحمَّل في Critical الآن) ──
-function loadRemainingAssets() {
-  // كل الأصول تُحمَّل في loadCriticalAssets الآن
-}
 function imgOK(img) { return img && img.complete && img.naturalWidth > 0; }
 
 // ── SAVE / LOAD ──
@@ -406,15 +297,15 @@ function loadLocal() {
 // ── حفظ سحابي في الخلفية ──
 let _cloudSaveTimer = null;
 function cloudSave() {
-  saveLocal(); // محلي فوراً دائماً
-  if (!GS.user || !navigator.onLine) return;
+  saveLocal(); // دائماً نحفظ محلياً أولاً
+  if (!GS.piUser) return;
   // تأخير 2 ثانية لتجميع التغييرات
   clearTimeout(_cloudSaveTimer);
   _cloudSaveTimer = setTimeout(_doCloudSave, 2000);
 }
 
 async function _doCloudSave() {
-  if (!GS.user) return;
+  if (!GS.piUser) return;
   try {
     const res = await fetch(`${SUPA_URL}/rest/v1/players`, {
       method: 'POST',
@@ -425,13 +316,11 @@ async function _doCloudSave() {
         'Prefer': 'resolution=merge-duplicates'
       },
       body: JSON.stringify({
-        google_uid:      GS.user.uid,
-        username:        GS.user.name,
+        pi_uid:          GS.piUser.uid,
+        pi_username:     GS.piUser.username,
         max_level:       GS.maxUnlocked,
         coins:           GS.coins,
         lives:           GS.lives,
-        all_worlds:      GS.allWorlds,
-        unlocked_worlds: JSON.stringify(GS.unlockedWorlds || []),
         world_progress:  GS.worldProgress,
         updated_at:      new Date().toISOString()
       })
@@ -449,12 +338,12 @@ async function _doCloudSave() {
 // يُحمَّل مرة واحدة فقط عند أول تسجيل دخول
 // بعدها يعتمد على المحلي + مزامنة في الخلفية
 async function cloudLoad() {
-  if (!GS.user) return;
+  if (!GS.piUser) return;
 
   // دائماً حمّل المحلي فوراً للعب الفوري
   loadLocal();
 
-  const alreadySynced = localStorage.getItem(SYNCED_KEY + '_' + GS.user.uid);
+  const alreadySynced = localStorage.getItem(SYNCED_KEY + '_' + GS.piUser.uid);
 
   // إذا سبق المزامنة → اكتفِ بالمحلي + مزامنة خلفية
   if (alreadySynced) {
@@ -471,7 +360,7 @@ async function cloudLoad() {
 
   try {
     const res = await fetch(
-      `${SUPA_URL}/rest/v1/players?google_uid=eq.${encodeURIComponent(GS.user.uid)}&select=*`,
+      `${SUPA_URL}/rest/v1/players?pi_uid=eq.${encodeURIComponent(GS.piUser.uid)}&select=*`,
       { headers: { 'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}` } }
     );
     if (res.ok) {
@@ -489,7 +378,7 @@ async function cloudLoad() {
         console.log('[Cloud] First sync done ✓');
       }
       saveLocal();
-      localStorage.setItem(SYNCED_KEY + '_' + GS.user.uid, '1');
+      localStorage.setItem(SYNCED_KEY + '_' + GS.piUser.uid, '1');
     }
   } catch(e) {
     loadLocal();
@@ -500,10 +389,10 @@ async function cloudLoad() {
 // ── مزامنة خلفية صامتة كل 5 دقائق ──
 function _syncInBackground() {
   setTimeout(async () => {
-    if (!GS.user || !navigator.onLine) return;
+    if (!GS.piUser || !navigator.onLine) return;
     try {
       const res = await fetch(
-        `${SUPA_URL}/rest/v1/players?google_uid=eq.${encodeURIComponent(GS.user.uid)}&select=max_level,coins,lives`,
+        `${SUPA_URL}/rest/v1/players?pi_uid=eq.${encodeURIComponent(GS.piUser.uid)}&select=max_level,coins,lives`,
         { headers: { 'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}` } }
       );
       if (res.ok) {
@@ -527,245 +416,163 @@ window.addEventListener('online', () => {
 });
 
 // ══════════════════════════════════════════════════════
-//  PI NETWORK — Authentication & Payments
-//  approve/complete تمر عبر Vercel Backend
-//  لأن Pi API يشترط Server API Key من backend فقط
+//  PI NETWORK (TESTNET) — Authentication & Payments
+//  approve/complete تمر عبر Netlify Function (Server API Key في الخادم فقط)
 // ══════════════════════════════════════════════════════
 
-// ══════════════════════════════════════════════════════
-//  GOOGLE AUTH & AD REWARDS — بدون Pi Network
-// ══════════════════════════════════════════════════════
+const PI_BACKEND = '/.netlify/functions/pi-payment';
+let   _piAccessToken = null;
 
-// Google Client ID — ضع Client ID الخاص بك هنا بعد إنشاء المشروع
-const GOOGLE_CLIENT_ID = '440239520472-tem61ie0t7k30qp9luql4f05thhagl6u.apps.googleusercontent.com';
-
-// AdMob IDs
-const ADMOB_APP_ID     = 'ca-app-pub-1152901043073265~9762922173';
-const ADMOB_REWARD_ID  = 'ca-app-pub-1152901043073265/9821943568';
-const ADMOB_SPLASH_ID  = 'ca-app-pub-1152901043073265/3720258008';
-
-// ── Google Login Callback ──
-function onGoogleLogin(response) {
-  try {
-    // فك تشفير JWT
-    const payload = JSON.parse(atob(response.credential.split('.')[1]));
-    GS.user = {
-      uid:      payload.sub,
-      name:     payload.name,
-      email:    payload.email,
-      picture:  payload.picture,
-    };
-    // حفظ الجلسة محلياً
-    localStorage.setItem('sp_google_user', JSON.stringify(GS.user));
-    console.log('[Auth] Google login:', GS.user.name);
-    const badge = document.getElementById('piUserBadge');
-    if (badge) { badge.textContent = GS.user.name; badge.style.display = 'block'; }
-    cloudSave();
-    cloudLoad().then(() => { showScreen('splash'); setSplashBG(); });
-  } catch(e) {
-    console.error('[Auth] Google login error:', e);
-    playGuest();
-  }
-}
-
-// ── تسجيل دخول تلقائي إذا كان محفوظاً ──
-function checkSavedLogin() {
-  const saved = localStorage.getItem('sp_google_user');
-  if (saved) {
-    try {
-      GS.user = JSON.parse(saved);
-      // حمّل البيانات المحلية فوراً بدون انتظار
-      loadLocal();
-      console.log('[Auth] Auto-login:', GS.user.name, '| Level:', GS.maxUnlocked, '| Coins:', GS.coins);
-      const badge = document.getElementById('piUserBadge');
-      if (badge) { badge.textContent = GS.user.name; badge.style.display = 'block'; }
-      // مزامنة خلفية صامتة بعد 3 ثوانٍ
-      setTimeout(() => _syncInBackground(), 3000);
-      return true;
-    } catch(e) {}
-  }
-  return false;
-}
-
-// ── اللعب كضيف ──
-function playGuest() {
-  GS.user = null;
-  showScreen('splash');
-  setSplashBG();
-}
-
-// ── تسجيل خروج ──
-function logout() {
-  localStorage.removeItem('sp_google_user');
-  GS.user = null;
-  showScreen('splash');
-}
-
-// ══════════════════════════════════════════════════════
-//  AD REWARD SYSTEM — نظام الإعلانات بمكافأة
-// ══════════════════════════════════════════════════════
-
-let _adPendingReward = null;
-let _adTimer = null;
-let _adRewarded = false;
-
-// مكافآت كل نوع
-const AD_REWARDS = {
-  ammo:   () => { curAmmo = Math.min(curAmmo + 20, 30); updAmmo(); alert('🎁 +20 Ammo added!'); },
-  lives:  () => { GS.lives += 3; updHUD(); alert('🎁 +3 Lives added!'); },
-  coins:  () => { GS.coins += 200; updHUD(); alert('🎁 +200 Coins added!'); },
-  unlock: () => {
-    const next = GS.maxUnlocked + 1;
-    if (next <= 150) { GS.maxUnlocked = next; buildLevelSelect(); alert('🎁 Next level unlocked!'); }
-    else { alert('🏆 You have unlocked all levels!'); }
-  },
+// المكافآت — المفاتيح يجب أن تطابق buy('<id>', price) في index.html وكتالوج الخادم
+const PI_REWARDS = {
+  coins:  () => { GS.coins += 1000; updHUD(); },
+  speed:  () => { GS.speedBoost = true; updHUD(); },
+  worlds: () => { GS.allWorlds = true; buildWorldGrid(); },
+  mega:   () => { GS.allWorlds = true; GS.coins += 1000; updHUD(); buildWorldGrid(); },
 };
 
-// ── عرض إعلان مكافأة ──
-function watchAd(rewardType) {
-  if (!AD_REWARDS[rewardType]) return;
-  _adPendingReward = rewardType;
-  _adRewarded = false; // لم يُكافأ بعد
-
-  const overlay = document.getElementById('adOverlay');
-  overlay.classList.add('show');
-
-  let secs = 5;
-  document.getElementById('adTimer').textContent = secs;
-  _adTimer = setInterval(() => {
-    secs--;
-    document.getElementById('adTimer').textContent = secs;
-    if (secs <= 0) {
-      clearInterval(_adTimer);
-      overlay.classList.remove('show');
-      _adRewarded = true;
-      // طبّق المكافأة فقط بعد انتهاء الإعلان
-      const reward = AD_REWARDS[_adPendingReward];
-      if (reward && _adRewarded) { reward(); saveLocal(); cloudSave(); }
-      _adPendingReward = null;
-      _adRewarded = false;
-    }
-  }, 1000);
-}
-
-// ── إعلان شاشة البداية (Splash Ad) ──
-function showSplashAd() {
-  // placeholder — سيُفعَّل في APK
-  console.log('[Ad] Splash ad would show here - ID:', ADMOB_SPLASH_ID);
-}
-
-
-
-// ══════════════════════════════════════════════════════
-//  SHOP TABS
-// ══════════════════════════════════════════════════════
-
-function switchShopTab(tab) {
-  ['ads','iap','ref'].forEach(t => {
-    const el = document.getElementById('shop-tab-' + t);
-    const btn = document.getElementById('tab-' + t);
-    if (el) el.style.display = 'none';
-    if (btn) { btn.style.background = 'transparent'; btn.style.color = '#FFD700'; }
-  });
-  const active = document.getElementById('shop-tab-' + tab);
-  const activeBtn = document.getElementById('tab-' + tab);
-  if (active) active.style.display = tab === 'ref' ? 'block' : 'grid';
-  if (activeBtn) { activeBtn.style.background = '#FFD700'; activeBtn.style.color = '#000'; }
-  // عرض كود الإحالة تلقائياً
-  if (tab === 'ref') {
-    const codeEl = document.getElementById('myRefCode');
-    if (codeEl && GS.user) codeEl.textContent = generateReferralCode(GS.user.uid);
-  }
-}
-
-// ══════════════════════════════════════════════════════
-//  IN-APP PURCHASES — مشتريات داخل التطبيق
-// ══════════════════════════════════════════════════════
-
-const IAP_ITEMS = {
-  next_level: { price: '$1.99', label: 'Next Level' },
-  all_levels: { price: '$3.99', label: 'All Levels' },
-  coins_1000: { price: '$1.00', label: '1000 Coins' },
-  hearts_20:  { price: '$1.00', label: '20 Hearts'  },
+const PI_MEMOS = {
+  coins:  'Super Cowboy: 1000 Coins',
+  speed:  'Super Cowboy: Speed Boost',
+  worlds: 'Super Cowboy: Unlock All Worlds',
+  mega:   'Super Cowboy: Mega Bundle (All Worlds + 1000 Coins)',
 };
 
-function buyIAP(item) {
-  const iap = IAP_ITEMS[item];
-  if (!iap) return;
-  // هنا سيتم ربط Google Play Billing لاحقاً
-  // الآن نعرض رسالة تأكيد
-  if (confirm('Buy ' + iap.label + ' for ' + iap.price + '?')) {
-    applyIAPReward(item);
-  }
-}
-
-function applyIAPReward(item) {
-  switch(item) {
-    case 'next_level':
-      const next = GS.maxUnlocked + 1;
-      if (next <= 150) { GS.maxUnlocked = next; buildLevelSelect(); }
-      alert('✅ Next level unlocked!');
-      break;
-    case 'all_levels':
-      GS.allWorlds = true;
-      // يفتح أول مرحلة من كل عالم فقط (1, 38, 75, 112)
-      GS.unlockedWorlds = [1, 38, 75, 112];
-      buildLevelSelect();
-      alert('✅ تم فتح العوالم الأربعة! ابدأ المرحلة الأولى من كل عالم.');
-      break;
-    case 'coins_1000':
-      GS.coins += 1000;
-      updHUD();
-      alert('✅ +1000 Coins added!');
-      break;
-    case 'hearts_20':
-      GS.lives += 20;
-      updHUD();
-      alert('✅ +20 Hearts added!');
-      break;
-  }
+function _applyPiReward(item) {
+  const fn = PI_REWARDS[item];
+  if (fn) fn();
+  try { SFX.play('purchase'); } catch(e) {}
   saveLocal();
   cloudSave();
 }
 
-// ══════════════════════════════════════════════════════
-//  REFERRAL SYSTEM — نظام الإحالة
-// ══════════════════════════════════════════════════════
-
-function generateReferralCode(uid) {
-  return 'SPG-' + uid.substring(0, 6).toUpperCase();
+// ── دفعة غير مكتملة من جلسة سابقة ──
+function onIncompletePaymentFound(payment) {
+  const paymentId = payment.identifier;
+  const txid = payment.transaction ? payment.transaction.txid : null;
+  const item = payment.metadata ? payment.metadata.item : null;
+  if (txid) _piCompletePayment(paymentId, txid, () => _applyPiReward(item));
+  else _piCancelPayment(paymentId);
 }
 
-function getReferralCode() {
-  if (!GS.user) { alert('Please login first'); return; }
-  const code = generateReferralCode(GS.user.uid);
-  const msg = '🎮 Play Super Pio and get a reward!\n\nReferral Code: ' + code + '\n\nShare with your friends and earn 5000 coins for every person who joins with your code!';
-  if (navigator.share) {
-    navigator.share({ title: 'Super Pio', text: msg });
-  } else {
-    navigator.clipboard.writeText(msg).then(() => alert('✅ Referral message copied!'));
+// ── تسجيل الدخول بـ Pi ──
+async function piAuth() {
+  try {
+    await _loadPiSdk();
+    if (typeof Pi === 'undefined') { alert('Please open the game in Pi Browser.'); playGuest(); return; }
+    _initPi();
+    const auth = await Promise.race([
+      Pi.authenticate(['username', 'payments'], onIncompletePaymentFound),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('Login timed out. Please try again from Pi Browser.')), 25000))
+    ]);
+    _piAccessToken = auth.accessToken;
+    GS.piUser = auth.user;
+    const badge = document.getElementById('piUserBadge');
+    if (badge) { badge.textContent = 'π ' + auth.user.username; badge.style.display = 'block'; }
+    loadLocal();
+    await cloudLoad();
+    showScreen('splash');
+    setSplashBG();
+  } catch(e) {
+    console.error('[Pi] Auth failed:', e);
+    alert('Pi login failed:\n' + ((e && (e.message || e.error)) || JSON.stringify(e)));
+    playGuest();
   }
 }
 
-function applyReferralCode(code) {
-  if (!code || !GS.user) return;
-  const used = localStorage.getItem('sp_ref_used');
-  if (used) { alert('You have already used a referral code'); return; }
-  if (code.startsWith('SPG-') && code.length === 10) {
-    GS.coins += 5000;
-    updHUD();
-    localStorage.setItem('sp_ref_used', '1');
-    saveLocal(); cloudSave();
-    alert('🎁 Done! You received 5000 coins as a referral reward!');
-  } else {
-    alert('❌ Invalid referral code');
+// ── اللعب كضيف ──
+function playGuest() {
+  GS.piUser = null;
+  _piAccessToken = null;
+  showScreen('splash');
+  setSplashBG();
+}
+
+function logout() {
+  GS.piUser = null;
+  _piAccessToken = null;
+  const badge = document.getElementById('piUserBadge');
+  if (badge) badge.style.display = 'none';
+  showScreen('piLogin');
+}
+
+// ── استدعاء الـ Backend ──
+function _callBackend(action, paymentId, txid) {
+  return fetch(PI_BACKEND, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ action, paymentId, txid }),
+  }).then(r => {
+    console.log(`[Pi] ${action} → HTTP ${r.status}`);
+    return r;
+  }).catch(e => {
+    console.warn(`[Pi] ${action} network error:`, e.message);
+    return null;
+  });
+}
+
+function _piApprovePayment(paymentId) { _callBackend('approve', paymentId, null); }   // بدون await
+function _piCancelPayment(paymentId)  { _callBackend('cancel',  paymentId, null); }
+
+// ── إكمال الدفعة: المكافأة تُمنح فقط إذا أكّد الخادم ──
+async function _piCompletePayment(paymentId, txid, onSuccess) {
+  const res = await _callBackend('complete', paymentId, txid);
+  if (res && res.ok) {
+    if (onSuccess) onSuccess();
+    return true;
+  }
+  alert('⚠️ Payment received but not confirmed yet.\nReopen the game to finish it — you will not be charged twice.');
+  return false;
+}
+
+// ── الشراء من المتجر (Pi الحقيقي) ──
+async function buy(item, amount) {
+  if (!GS.piUser) {
+    alert('🔐 Please login with Pi Network to purchase!');
+    return;
+  }
+  if (!PI_REWARDS[item]) { alert('Unknown item'); return; }
+
+  const paymentData = {
+    amount,
+    memo:     PI_MEMOS[item] || 'Super Cowboy Purchase',
+    metadata: { item, player: GS.piUser.uid }
+  };
+
+  const paymentCallbacks = {
+    onReadyForServerApproval: (paymentId) => {
+      console.log('[Pi] onReadyForServerApproval:', paymentId);
+      _piApprovePayment(paymentId);
+    },
+    onReadyForServerCompletion: async (paymentId, txid) => {
+      console.log('[Pi] onReadyForServerCompletion:', paymentId, txid);
+      const ok = await _piCompletePayment(paymentId, txid, () => _applyPiReward(item));
+      if (ok) alert('✅ Purchase successful! Enjoy your ' + (PI_MEMOS[item] || item) + '!');
+    },
+    onCancel: (paymentId) => {
+      console.log('[Pi] Cancelled:', paymentId);
+      _piCancelPayment(paymentId);
+    },
+    onError: (err, payment) => {
+      console.error('[Pi] Error:', err, payment);
+      if (payment && payment.identifier) _piCancelPayment(payment.identifier);
+      alert('❌ Payment error. Please try again.');
+    },
+  };
+
+  try {
+    Pi.createPayment(paymentData, paymentCallbacks);
+  } catch(e) {
+    console.error('[Pi] createPayment failed:', e);
+    alert('❌ Could not start payment. Make sure you are in Pi Browser.');
   }
 }
 
-function showReferralDialog() {
-  const code = prompt('Enter referral code (example: SPG-ABC123):');
-  if (code) applyReferralCode(code.trim().toUpperCase());
-}
+// ══════════════════════════════════════════════════════
+//  SHOP
+// ══════════════════════════════════════════════════════
+
+function switchShopTab() { /* single tab: Pi Store */ }
 
 // ══════════════════════════════════════════════════════
 //  EXIT DIALOG — تنبيه الخروج
@@ -780,12 +587,8 @@ function cancelExit() {
 }
 
 function confirmExit() {
-  if (window.AndroidBridge && window.AndroidBridge.exitApp) {
-    window.AndroidBridge.exitApp();
-  } else {
-    window.close();
-    history.back();
-  }
+  window.close();
+  history.back();
 }
 
 // Intercept back button
@@ -801,8 +604,13 @@ document.addEventListener('keydown', (e) => {
 
 // ── SCREEN MANAGEMENT ──
 function showScreen(id) {
-  const mains = ['loadingScreen','splash','worldSelect','levelSelect','gameScreen'];
+  const mains = ['loadingScreen','piLogin','splash','worldSelect','levelSelect','gameScreen'];
   const subs  = ['winScreen','loseScreen','shopScreen'];
+
+  // إيقاف الأصوات عند الخروج من المرحلة
+  const wasInGame = document.getElementById('gameScreen')?.classList.contains('active');
+  const leavingGame = wasInGame && !['gameScreen','winScreen','loseScreen'].includes(id);
+  if (leavingGame) { try { SFX.stopAll(); } catch(e){} }
 
   mains.forEach(s => { const el = document.getElementById(s); if(el) el.classList.remove('active'); });
   subs.forEach(s => { const el = document.getElementById(s); if(el) el.classList.remove('active'); });
@@ -819,7 +627,12 @@ function showScreen(id) {
 
 function setSplashBG() {
   const bg = document.getElementById('splashBG');
-  if (bg && UI_IMGS.splash) bg.style.backgroundImage = `url(${UI_IMGS.splash.src})`;
+  if (bg && UI_IMGS.splash) {
+    const splashSrc = window.location.protocol === 'file:'
+      ? UI_IMGS.splash.src
+      : UI_IMGS.splash.src;
+    bg.style.backgroundImage = `url(${splashSrc})`;
+  }
 }
 
 // ── WORLD SELECT ──
@@ -834,9 +647,9 @@ function showWorldSelect() {
 
 const WORLDS = [
   { id:1, name:'Nature',    img:'world_nature',    minLevel:1,  bgKey:'bg_nature'    },
-  { id:2, name:'Graveyard', img:'world_graveyard', minLevel:11, bgKey:'bg_graveyard' },
-  { id:3, name:'Winter',    img:'world_winter',    minLevel:21, bgKey:'bg_winter'    },
-  { id:4, name:'Desert',    img:'world_desert',    minLevel:31, bgKey:'bg_desert'    },
+  { id:2, name:'Graveyard', img:'world_graveyard', minLevel:26, bgKey:'bg_graveyard' },
+  { id:3, name:'Winter',    img:'world_winter',    minLevel:51, bgKey:'bg_winter'    },
+  { id:4, name:'Desert',    img:'world_desert',    minLevel:76, bgKey:'bg_desert'    },
 ];
 
 function buildWorldGrid() {
@@ -897,22 +710,19 @@ function showLevelSelect(wid) {
 function buildLevelGrid(wid) {
   const grid = document.getElementById('levelsGrid');
   grid.innerHTML = '';
-  const startLv = (wid - 1) * 37 + 1;  // كل عالم ~37 مرحلة = 148 + bonus
+  const startLv = (wid - 1) * 25 + 1;
+  const endLv   = startLv + 24;
 
-  const levelsPerWorld = wid < 4 ? 37 : 39; // العالم الأخير 39 = المجموع 150
-  for (let i = 0; i < levelsPerWorld; i++) {
-    const lv = startLv + i;
-    const worldFirstLevel = startLv; // أول مرحلة في هذا العالم
-    const unlocked = GS.maxUnlocked >= lv || 
-                     (GS.allWorlds && GS.unlockedWorlds && GS.unlockedWorlds.includes(worldFirstLevel) && lv === worldFirstLevel) ||
-                     (!GS.allWorlds && GS.maxUnlocked >= lv);
-    const done = GS.maxUnlocked > lv;
+  for (let lv = startLv; lv <= endLv; lv++) {
+    const worldUnlocked = GS.allWorlds && lv === startLv;
+    const unlocked = worldUnlocked || GS.maxUnlocked >= lv;
+    const done     = GS.maxUnlocked > lv;
 
     const btn = document.createElement('button');
     btn.className = `lv-btn ${done ? 'done' : unlocked ? 'unlocked' : 'locked'}`;
 
     if (unlocked) {
-      btn.textContent = lv;
+      btn.textContent = lv - startLv + 1;
       btn.onclick = () => startLevel(lv);
     } else {
       btn.textContent = '🔒';
@@ -1080,7 +890,8 @@ function spawnPlayer(ld, cx, cy) {
 
 // ── GAME LOOP ──
 function loop(ts) {
-  const dt = Math.min((ts - lastT) / 16.67, 3);
+  const rawDt = (ts - lastT) / 16.67;
+  const dt = (rawDt > 5 || lastT === 0) ? 1 : Math.min(rawDt, 3);
   lastT = ts;
   if (!paused && gameStatus === 'playing') update(dt);
   render();
@@ -1279,7 +1090,7 @@ function breakBlock(tile) {
     spawnBreakParticles(tile.x + TS/2, tile.y + TS/2, LEVELS[GS.curLevel].theme);
     if (pk.hasHeart) {
       // قلب مخفي
-      GS.lives = Math.min(GS.lives + 1, 9);
+      GS.lives = Math.min(GS.lives + 1, 99);
       updHUD();
       SFX.play('heart');
       spawnHeartPopup(tile.x - camera.x + TS/2, tile.y);
@@ -1423,7 +1234,7 @@ function updEnemies(dt) {
     // أصوات الأعداء أثناء الحركة
     if (!e.soundT) e.soundT = 60 + Math.random() * 120;
     e.soundT -= dt;
-    if (e.soundT <= 0) {
+    if (e.soundT <= 0 && !e.dead) {
       e.soundT = 80 + Math.random() * 100;
       const screenX = e.x - camera.x;
       if (screenX > -100 && screenX < canvas.width + 100) {
@@ -2266,7 +2077,7 @@ function retryLvl() {
   cancelAnimationFrame(raf);
   clearInterval(timerInt);
   gameStatus = 'idle';
-  GS.lives = 3;   // reset lives on retry
+  if (GS.lives < 1) GS.lives = 3;   // أعد 3 قلوب فقط إذا نفدت (يحافظ على القلوب المشتراة)
   setTimeout(() => startLevel(GS.curLevel), 50);
 }
 
@@ -2336,7 +2147,8 @@ function resumeGame() {
   paused = false;
   document.getElementById('pauseOv').classList.remove('show');
   lastT = performance.now();
-  startTimer(lvTimer); // restart timer from where we left off
+  if (player && !player.dead) { player.inv = true; player.invT = 90; }
+  startTimer(lvTimer);
 }
 
 // ── SHOP ──
@@ -2444,8 +2256,8 @@ async function _loadLeaderboard(tab) {
       return `<span class="lb-rank">#${i + 1}</span>`;
     };
 
-    const myUid      = GS.user?.uid;
-    const myUsername = GS.user?.name || '';
+    const myUid      = GS.piUser?.uid;
+    const myUsername = GS.piUser?.username || '';
 
     const html = rows.map((r, i) => {
       const name   = r.pi_username || 'Unknown';
@@ -2478,14 +2290,14 @@ function _renderMyRank() {
   const panel = document.getElementById('lbMyRank');
   if (!panel) return;
 
-  if (!GS.user) {
+  if (!GS.piUser) {
     panel.style.display = 'none';
     return;
   }
 
   panel.style.display = 'flex';
-  document.getElementById('lbMyAvatar').textContent = GS.user.name.charAt(0).toUpperCase();
-  document.getElementById('lbMyName').textContent   = GS.user.name;
+  document.getElementById('lbMyAvatar').textContent = GS.piUser.username.charAt(0).toUpperCase();
+  document.getElementById('lbMyName').textContent   = GS.piUser.username;
   document.getElementById('lbMyDetail').textContent = `Level ${GS.maxUnlocked} · ${GS.coins.toLocaleString()} coins`;
   document.getElementById('lbMyScore').textContent  = `Lv ${GS.maxUnlocked}`;
 
@@ -2494,7 +2306,7 @@ function _renderMyRank() {
 }
 
 async function _fetchMyRank() {
-  if (!GS.user) return;
+  if (!GS.piUser) return;
   try {
     // عدد اللاعبين الذين لديهم max_level أعلى
     const res = await fetch(
@@ -2512,37 +2324,92 @@ async function _fetchMyRank() {
 }
 
 // ── INIT ──
-window.addEventListener('load', async () => {
+// ── حفظ الأصول على الجهاز (Cache) حتى لا تُحمَّل في كل مرة ──
+function _saveAssetsOnDevice() {
+  try {
+    if (navigator.storage && navigator.storage.persist) navigator.storage.persist();   // اطلب عدم حذفها تلقائياً
+    if (!('serviceWorker' in navigator)) return;
+    const urls = Assets.log().concat(SFX.urls());
+    navigator.serviceWorker.ready.then(reg => {
+      if (reg.active) reg.active.postMessage({ type: 'precache', urls });
+    }).catch(() => {});
+  } catch (e) {}
+}
+
+// Pi SDK يُحمَّل بدون حجب الصفحة (إذا تأخر أو فشل لا تتوقف اللعبة)
+let _piInited = false;
+// داخل sandbox.minepi.com => sandbox:true ، وفي Pi Browser العادي => false (هوية التطبيق Testnet تُحدَّد برابط الموقع)
+// للإجبار: ?sandbox=1 أو ?sandbox=0
+function _isSandboxEnv() {
+  const q = location.search;
+  if (q.indexOf('sandbox=1') !== -1) return true;
+  if (q.indexOf('sandbox=0') !== -1) return false;
+  let anc = '';
+  try { anc = (location.ancestorOrigins && location.ancestorOrigins[0]) || document.referrer || ''; } catch(e) {}
+  let framed = false;
+  try { framed = window.self !== window.top; } catch(e) { framed = true; }
+  return anc.indexOf('sandbox.minepi.com') !== -1 || framed;
+}
+function _initPi() {
+  if (_piInited || typeof Pi === 'undefined') return;
+  try { Pi.init({ version: '2.0', sandbox: _isSandboxEnv() }); _piInited = true; }
+  catch(e) { console.error('[Pi] init failed:', e); }
+}
+function _loadPiSdk() {
+  return new Promise(res => {
+    if (typeof Pi !== 'undefined') { _initPi(); return res(); }
+    const s = document.createElement('script');
+    s.src = 'https://sdk.minepi.com/pi-sdk.js';
+    s.async = true;
+    s.onload  = () => { _initPi(); res(); };
+    s.onerror = () => res();
+    document.head.appendChild(s);
+    setTimeout(res, 3000);            // لا ننتظر أكثر من 3 ثوانٍ
+  });
+}
+
+// Shows the list of missing REQUIRED files and waits for the player: Retry or Continue.
+function _showLoadReport(failed) {
+  return new Promise(resolve => {
+    const box = document.getElementById('ldReport');
+    const list = document.getElementById('ldReportList');
+    const title = document.getElementById('ldReportTitle');
+    if (!box) return resolve('continue');
+    title.textContent = '⚠️ ' + failed.length + ' game file(s) could not be loaded:';
+    list.textContent = failed.slice(0, 14).join('\n') + (failed.length > 14 ? '\n… +' + (failed.length - 14) + ' more' : '');
+    box.style.display = 'block';
+    const done = which => { box.style.display = 'none'; resolve(which); };
+    document.getElementById('ldRetry').onclick = () => done('retry');
+    document.getElementById('ldContinue').onclick = () => done('continue');
+  });
+}
+
+async function _boot() {
   const lbg = document.getElementById('loadBG');
 
   ldProgress(5, 'Starting...');
-  await new Promise(r => setTimeout(r, 50));
+  _loadPiSdk();                       // في الخلفية — لا ننتظره
 
-  ldProgress(15, 'Initializing...');
-  try {
-    if (typeof Pi !== 'undefined') Pi.init({ version: '2.0', sandbox: true });
-  } catch(e) {}
-
-  ldProgress(25, 'Loading assets...');
-  await new Promise(r => setTimeout(r, 30));
-
-  // تحميل كل الأصول مع تتبع حقيقي للتقدم
-  totalToLoad = 0;
-  loadedCount = 0;
-  
-  // نستبدل updateLoadBar لتعرض النسبة الحقيقية
-  window._origUpdateLoadBar = updateLoadBar;
-  window.updateLoadBar = function() {
-    const pct = totalToLoad > 0 ? Math.round(loadedCount / totalToLoad * 100) : 0;
-    ldProgress(Math.max(20, Math.min(95, 20 + pct * 0.75)), 'Loading assets... ' + pct + '%');
+  // ── تحميل كل الأصول؛ لا تبدأ اللعبة قبل اكتمالها ──
+  ldProgress(10, 'Loading assets... 0%');
+  const onProgress = (done, total) => {
+    const pct = Math.round(done / total * 100);
+    ldProgress(10 + pct * 0.8, 'Loading assets... ' + pct + '%');
   };
+  let res = await Assets.loadAll(onProgress);
+  while (res.failed.length) {
+    console.warn('[Assets] missing required files:', res.failed);
+    const choice = await _showLoadReport(res.failed);
+    if (choice === 'continue') break;
+    ldProgress(10, 'Retrying...');
+    res = await Assets.loadAll(onProgress);
+  }
 
-  await loadCriticalAssets();
-  window.updateLoadBar = window._origUpdateLoadBar;
+  ldProgress(93, 'Loading sounds...');
+  try { await SFX.preloadAll(); } catch(e) {}
 
-  ldProgress(90, 'Preparing levels...');
+  ldProgress(97, 'Preparing levels...');
   loadLocal();
-  await new Promise(r => setTimeout(r, 30));
 
   if (lbg && UI_IMGS.splash) {
     lbg.style.backgroundImage = `url(${UI_IMGS.splash.src})`;
@@ -2550,14 +2417,14 @@ window.addEventListener('load', async () => {
   }
 
   ldProgress(100, 'Ready!');
-  await new Promise(r => setTimeout(r, 500));
+  await new Promise(r => setTimeout(r, 400));
 
-  checkSavedLogin();
-  showScreen('splash');
-  setSplashBG();
-
-  // loadRemainingAssets removed - all loaded upfront
-});
+  // الدخول عبر Pi Network (أو اللعب كضيف)
+  showScreen('piLogin');
+  _saveAssetsOnDevice();
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _boot);
+else _boot();
 
 function ldProgress(p, txt) {
   const bar = document.getElementById('ldBar');
