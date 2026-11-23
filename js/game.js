@@ -17,10 +17,42 @@ const MAX_VY = 16;
 // Tile cell codes
 const T = { AIR:0,GND:1,PLT:2,COIN:3,WALKER:4,FLYER:5,AMMO:6,GOAL:7,SPIKE:8,BREAK:9,SPRING:10,CRUMBLE:11,HEART:12 };
 
-// ── SUPABASE CONFIG (Cloud Save) ──
-const SUPA_URL = 'https://xwkosqpxfihgprfququw.supabase.co';
+// ── السيرفر (حفظ سحابي + لوحة الصدارة + الدفع) ──
+// نسخة π-test: مسار نسبي = دوال Netlify الخاصة بموقع الاختبار نفسه (كما في ملف الاختبار: '/.netlify/functions/pi-payment')
+const API_BASE = '/.netlify/functions';
+const GAME_API = API_BASE + '/pi-game';
+async function _gameApi(body) {
+  const r = await fetch(GAME_API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
 
-const SUPA_KEY = 'sb_publishable_TA1liFGVpi9Sw1HoTJz24Q_lg_3XvHv';
+// ── أصوات بيئية لكل عالم (بدل الموسيقى) — ملفات اختيارية في assets/sounds/ ──
+// amb_nature.ogg | amb_graveyard.ogg | amb_winter.ogg | amb_desert.ogg
+// إن لم يوجد الملف يستمر اللعب بصمت دون أي خطأ.
+const AMB = (() => {
+  const FILES = { nature:'amb_nature.ogg', graveyard:'amb_graveyard.ogg', winter:'amb_winter.ogg', desert:'amb_desert.ogg' };
+  const VOL = 0.3;
+  let el = null;
+  function stop() { if (el) { try { el.pause(); } catch (e) {} el = null; } }
+  function start(theme) {
+    stop();
+    const f = FILES[theme]; if (!f) return;
+    try { if (SFX.isMuted()) return; } catch (e) {}
+    const a = new Audio('assets/sounds/' + f);
+    a.loop = true; a.volume = VOL;
+    a.addEventListener('error', () => { if (el === a) el = null; });
+    el = a;
+    const pr = a.play(); if (pr && pr.catch) pr.catch(() => {});
+  }
+  function pause()  { if (el) try { el.pause(); } catch (e) {} }
+  function resume() { if (el) { try { if (SFX.isMuted()) return; } catch (e) {} const pr = el.play(); if (pr && pr.catch) pr.catch(() => {}); } }
+  return { start, stop, pause, resume };
+})();
 
 // ── AUDIO SYSTEM ──
 // نستخدم AudioContext + XHR للأصوات الحرجة (تشغيل فوري بلا تأخير)
@@ -198,6 +230,7 @@ let shopFrom = 'splash';
 
 // ── CHECKPOINT ──
 let checkpoint = { x: 0, y: 0 };      // آخر موقع آمن على الأرض
+let castle = null;                    // قصر نهاية المرحلة {c} أو null
 let reviveCheckpoint = { x: 0, y: 0 }; // موقع الموت لاستعادة الشخصية
 
 // ── LEVEL DATA ──
@@ -222,6 +255,80 @@ const TILE_IMGS = {};  // TILE_IMGS['nature'][1] = Image
 const OBJ_IMGS  = {};  // OBJ_IMGS['nature']['Tree_1.png'] = Image
 const UI_IMGS   = {};  // UI_IMGS.splash = Image
 let allLoaded = false;
+
+// ══════════════════════════════════════════════════════
+//  PROPS — صور القصور والأشواك والنوابض (مجلد assets/props/)
+//  تُحمَّل هنا مباشرة؛ وإن غاب أي ملف تُرسم بدائل برمجية
+// ══════════════════════════════════════════════════════
+const PROPS_DIR = 'assets/props/';
+const PROPS = {};
+const PROP_FILES = [
+  'Palace nature.png','Palace Cemetery.png','Ice Palace.png','Palace desert.png',
+  'Plant thorns1.png','Plant thorns2.png','ThornsGraveyard1.png','ThornsGraveyard2.png',
+  'Ice Thorns1.png','Ice Thorns2.png','Desert Thorns1.png','Desert Thorns2.png',
+  'nabid1.png','nabid2.png','nabid3.png','nabid4.png',
+];
+function loadProps() {
+  for (const f of PROP_FILES) {
+    if (PROPS[f]) continue;
+    const img = new Image();
+    img.src = PROPS_DIR + encodeURIComponent(f);
+    PROPS[f] = img;
+  }
+}
+loadProps();
+
+// القصر: ملف الصورة لكل عالم + موضع الباب داخل الصورة (نسب من 0 إلى 1)
+//  doorX: مركز الباب أفقياً | doorH: ارتفاع الباب | base: كم يُغرَس أسفل الصورة في الأرض
+const CASTLE = {
+  nature:    { file:'Palace nature.png',   doorX:0.51,  doorH:0.26, base:0.09  },
+  graveyard: { file:'Palace Cemetery.png', doorX:0.506, doorH:0.28, base:0.08  },
+  winter:    { file:'Ice Palace.png',      doorX:0.50,  doorH:0.26, base:0.08  },
+  desert:    { file:'Palace desert.png',   doorX:0.52,  doorH:0.25, base:0.145 },
+};
+// الأشواك: صورتان لكل عالم (1 و 2) + أبعادها الأصلية لحساب النسبة
+const SPIKE_IMG = {
+  nature:    ['Plant thorns1.png','Plant thorns2.png'],
+  graveyard: ['ThornsGraveyard1.png','ThornsGraveyard2.png'],
+  winter:    ['Ice Thorns1.png','Ice Thorns2.png'],
+  desert:    ['Desert Thorns1.png','Desert Thorns2.png'],
+};
+const SPIKE_ASPECT = {
+  'Plant thorns1.png':270/138,  'Plant thorns2.png':473/204,
+  'ThornsGraveyard1.png':319/178,'ThornsGraveyard2.png':514/177,
+  'Ice Thorns1.png':319/215,    'Ice Thorns2.png':516/211,
+  'Desert Thorns1.png':319/179, 'Desert Thorns2.png':516/166,
+};
+// النابض: إطارات الحركة من الانضغاط إلى الامتداد (الباقي نسخ مكررة)
+const SPRING_FRAMES = ['nabid4.png','nabid3.png','nabid2.png','nabid1.png'];
+const SPRING_REST   = 'nabid1.png';
+const _trimCache = {};
+// يقصّ الحواف الشفافة ويقيس عرض القاعدة ليبقى حجم النابض ثابتاً بين الإطارات
+function springSprite(file) {
+  if (_trimCache[file]) return _trimCache[file];
+  const img = PROPS[file];
+  if (!imgOK(img)) return null;
+  let bb = { x:0, y:0, w:img.naturalWidth, h:img.naturalHeight }, baseW = bb.w;
+  try {
+    const cv = document.createElement('canvas');
+    cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+    const cx = cv.getContext('2d'); cx.drawImage(img, 0, 0);
+    const d = cx.getImageData(0, 0, cv.width, cv.height).data;
+    let x0 = cv.width, x1 = -1, y0 = cv.height, y1 = -1;
+    for (let y = 0; y < cv.height; y++) for (let x = 0; x < cv.width; x++) {
+      if (d[(y*cv.width + x)*4 + 3] > 24) { if (x<x0)x0=x; if (x>x1)x1=x; if (y<y0)y0=y; if (y>y1)y1=y; }
+    }
+    if (x1 >= 0) {
+      bb = { x:x0, y:y0, w:x1-x0+1, h:y1-y0+1 };
+      // عرض القاعدة = عرض الصف المعتم عند 8% فوق أسفل الصورة
+      const ry = Math.max(y0, y1 - Math.round(bb.h * 0.08));
+      let a = cv.width, b = -1;
+      for (let x = 0; x < cv.width; x++) if (d[(ry*cv.width + x)*4 + 3] > 24) { if (x<a)a=x; if (x>b)b=x; }
+      if (b > a) baseW = b - a + 1;
+    }
+  } catch (e) { /* ملفات محلية: نكتفي بالمقاييس التقريبية */ }
+  return (_trimCache[file] = { img, bb, baseW });
+}
 
 // ── SETUP ROTATION (portrait device → landscape game) ──
 function setupRotation() {
@@ -307,25 +414,16 @@ function cloudSave() {
 async function _doCloudSave() {
   if (!GS.piUser) return;
   try {
-    const res = await fetch(`${SUPA_URL}/rest/v1/players`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'apikey': SUPA_KEY,
-        'Authorization': `Bearer ${SUPA_KEY}`,
-        'Prefer': 'resolution=merge-duplicates'
-      },
-      body: JSON.stringify({
-        pi_uid:          GS.piUser.uid,
-        pi_username:     GS.piUser.username,
-        max_level:       GS.maxUnlocked,
-        coins:           GS.coins,
-        lives:           GS.lives,
-        world_progress:  GS.worldProgress,
-        updated_at:      new Date().toISOString()
-      })
+    if (!_piAccessToken) return;
+    const out = await _gameApi({
+      action:         'save',
+      accessToken:    _piAccessToken,
+      max_level:      GS.maxUnlocked,
+      coins:          GS.coins,
+      lives:          GS.lives,
+      world_progress: GS.worldProgress
     });
-    if (res.ok) {
+    if (out && out.ok) {
       localStorage.setItem(SYNC_TS_KEY, Date.now().toString());
       console.log('[Cloud] Saved ✓');
     }
@@ -359,14 +457,11 @@ async function cloudLoad() {
   }
 
   try {
-    const res = await fetch(
-      `${SUPA_URL}/rest/v1/players?pi_uid=eq.${encodeURIComponent(GS.piUser.uid)}&select=*`,
-      { headers: { 'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}` } }
-    );
-    if (res.ok) {
-      const data = await res.json();
-      if (Array.isArray(data) && data[0]) {
-        const d = data[0];
+    if (!_piAccessToken) throw new Error('no token');
+    const data = await _gameApi({ action: 'load', accessToken: _piAccessToken });
+    {
+      if (data && data.player) {
+        const d = data.player;
         // خذ أفضل بيانات بين المحلي والسحابي
         const local = JSON.parse(localStorage.getItem(SAVE_KEY) || '{}');
         GS.maxUnlocked    = Math.max(d.max_level || 1, local.m || 1);
@@ -391,12 +486,9 @@ function _syncInBackground() {
   setTimeout(async () => {
     if (!GS.piUser || !navigator.onLine) return;
     try {
-      const res = await fetch(
-        `${SUPA_URL}/rest/v1/players?pi_uid=eq.${encodeURIComponent(GS.piUser.uid)}&select=max_level,coins,lives`,
-        { headers: { 'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}` } }
-      );
-      if (res.ok) {
-        const data = await res.json();
+      if (_piAccessToken) {
+        const r = await _gameApi({ action: 'load', accessToken: _piAccessToken });
+        const data = r && r.player ? [r.player] : [];
         if (data[0]) {
           // خذ الأعلى دائماً
           if ((data[0].max_level || 0) > GS.maxUnlocked) {
@@ -416,27 +508,49 @@ window.addEventListener('online', () => {
 });
 
 // ══════════════════════════════════════════════════════
-//  PI NETWORK (TESTNET) — Authentication & Payments
-//  approve/complete تمر عبر Netlify Function (Server API Key في الخادم فقط)
+//  PI NETWORK (TESTNET / π-test) — Authentication & Payments
+//  approve/complete تمر عبر دالة الخادم (Server API Key في الخادم فقط)
 // ══════════════════════════════════════════════════════
 
-const PI_BACKEND = '/.netlify/functions/pi-payment';
+const PI_BACKEND = API_BASE + '/pi-payment';
 let   _piAccessToken = null;
 
 // المكافآت — المفاتيح يجب أن تطابق buy('<id>', price) في index.html وكتالوج الخادم
 const PI_REWARDS = {
   coins:  () => { GS.coins += 1000; updHUD(); },
   speed:  () => { GS.speedBoost = true; updHUD(); },
-  worlds: () => { GS.allWorlds = true; buildWorldGrid(); },
+  hearts: () => { GS.lives = Math.min(99, GS.lives + 20); updHUD(); },      // 0.2π
+  level:  () => { unlockNextLevel(); },                                      // 0.2π — المرحلة التالية فقط
+  world:  () => { unlockNextWorld(); },                                      // 0.5π — العالم التالي فقط
+  worlds: () => { GS.allWorlds = true; buildWorldGrid(); },                  // قديم (للدفعات المعلّقة فقط)
   mega:   () => { GS.allWorlds = true; GS.coins += 1000; updHUD(); buildWorldGrid(); },
 };
 
 const PI_MEMOS = {
   coins:  'Super Cowboy: 1000 Coins',
   speed:  'Super Cowboy: Speed Boost',
+  hearts: 'Super Cowboy: 20 Hearts',
+  level:  'Super Cowboy: Unlock Next Level',
+  world:  'Super Cowboy: Unlock Next World',
   worlds: 'Super Cowboy: Unlock All Worlds',
   mega:   'Super Cowboy: Mega Bundle (All Worlds + 1000 Coins)',
 };
+
+// فتح المرحلة التالية فقط (+1)
+function unlockNextLevel() {
+  if (GS.maxUnlocked < 100) GS.maxUnlocked++;
+  _refreshUnlockUI();
+}
+// فتح العالم التالي فقط: أول مرحلة في أقرب عالم مقفل (العوالم التي بعده تبقى مقفلة)
+function unlockNextWorld() {
+  const w = WORLDS.find(w => w.minLevel > GS.maxUnlocked);
+  if (w) GS.maxUnlocked = w.minLevel;
+  _refreshUnlockUI();
+}
+function _refreshUnlockUI() {
+  try { buildWorldGrid(); } catch (e) {}
+  try { if (typeof selectedWorld !== 'undefined' && selectedWorld) buildLevelGrid(selectedWorld); } catch (e) {}
+}
 
 function _applyPiReward(item) {
   const fn = PI_REWARDS[item];
@@ -455,35 +569,149 @@ function onIncompletePaymentFound(payment) {
   else _piCancelPayment(paymentId);
 }
 
-// ── تسجيل الدخول بـ Pi ──
-async function piAuth() {
+// ── واجهة الدخول: الشارة + زر "Login with Pi" للضيوف ──
+const BUILD_ID = 'login-v8';
+
+// ينشئ العناصر الناقصة بنفسه حتى لو كان index.html نسخة قديمة
+function _ensureLoginUI() {
+  const splash = document.getElementById('splash');
+  if (splash && !document.getElementById('btnPiLoginSplash')) {
+    const b = document.createElement('button');
+    b.id = 'btnPiLoginSplash';
+    b.className = 'pi-btn';
+    b.textContent = '🔐 Login with Pi';
+    b.style.cssText = 'position:absolute;top:16px;left:14px;z-index:5;padding:7px 14px;font-size:11px;letter-spacing:0;display:none;';
+    b.onclick = () => piAuth({ stay: true });
+    splash.appendChild(b);
+  }
+  const login = document.getElementById('piLogin');
+  if (login && !document.getElementById('piLoginMsg')) {
+    const m = document.createElement('div');
+    m.id = 'piLoginMsg';
+    m.style.cssText = 'display:none;margin-top:16px;max-width:300px;padding:10px 12px;background:rgba(120,0,0,0.5);border:1px solid #ff6b6b;border-radius:10px;font-size:11px;color:#ffd0d0;text-align:center;line-height:1.5;white-space:pre-wrap;word-break:break-word;';
+    login.appendChild(m);
+  }
+  if (!document.getElementById('buildInfo')) {
+    const i = document.createElement('div');
+    i.id = 'buildInfo';
+    i.style.cssText = 'position:fixed;bottom:3px;left:6px;font-size:9px;color:#888;z-index:10000;pointer-events:none;';
+    document.body.appendChild(i);
+  }
+}
+
+function _updateBuildInfo() {
+  const i = document.getElementById('buildInfo');
+  const inPiBrowser = /PiBrowser/i.test(navigator.userAgent || '');
+  let framed = false; try { framed = window.self !== window.top; } catch(e) { framed = true; }
+  if (i) i.textContent = BUILD_ID + ' · v:' + (window.APP_VERSION || '?') + ' · SDK:' + (typeof Pi !== 'undefined' ? 'ok' : 'missing') +
+    ' · sandbox:' + _inPiSandbox() + ' · PiBrowser:' + (inPiBrowser ? 'yes' : 'no') +
+    ' · init:' + (_piInited ? 'ok' : ('fail' + (_piInitError ? '(' + _piInitError + ')' : ''))) +
+    ' · framed:' + (framed ? 'yes' : 'no');
+}
+
+function _updatePiUI() {
+  _ensureLoginUI();
+  _updateBuildInfo();
+  const badge = document.getElementById('piUserBadge');
+  const btn   = document.getElementById('btnPiLoginSplash');
+  if (badge) {
+    if (GS.piUser) { badge.textContent = 'π ' + GS.piUser.username; badge.style.display = 'block'; }
+    else badge.style.display = 'none';
+  }
+  if (btn) btn.style.display = GS.piUser ? 'none' : 'block';
+}
+
+function _piMsg(text) {
+  const el = document.getElementById('piLoginMsg');
+  const onLoginScreen = document.getElementById('piLogin')?.classList.contains('active');
+  if (el && onLoginScreen) { el.textContent = text; el.style.display = text ? 'block' : 'none'; }
+  else if (text) alert(text);
+}
+
+function _addModeButton() {
+  const box = document.getElementById('piLoginMsg');
+  if (!box) return;
+  const old = document.getElementById('piModeBtn');
+  if (old) old.remove();
+  const toSandbox = !_inPiSandbox();
+  const b = document.createElement('button');
+  b.id = 'piModeBtn';
+  b.textContent = toSandbox ? 'Retry in Sandbox mode' : 'Retry in normal mode';
+  b.style.cssText = 'display:block;margin:10px auto 0;padding:7px 14px;border:1px solid #fff;border-radius:16px;background:transparent;color:#fff;font-size:11px;cursor:pointer;';
+  b.onclick = () => { location.href = location.pathname + '?sandbox=' + (toSandbox ? '1' : '0'); };
+  box.appendChild(b);
+}
+
+let _piAuthBusy = false;
+
+// ── تسجيل الدخول بـ Pi ──  (stay=true: لا تغيّر الشاشة الحالية، مثل المتجر)
+async function piAuth(opts) {
+  const stay = !!(opts && opts.stay);
+  if (_piAuthBusy) return false;
+  _piAuthBusy = true;
+  _piMsg('');
+  const btns = document.querySelectorAll('.pi-btn, #btnPiLoginSplash');
+  btns.forEach(b => { b.disabled = true; b.style.opacity = '0.6'; });
   try {
     await _loadPiSdk();
-    if (typeof Pi === 'undefined') { alert('Please open the game in Pi Browser.'); playGuest(); return; }
-    _initPi();
-    const auth = await Promise.race([
+    if (typeof Pi === 'undefined') {
+      _piMsg('Pi SDK is not available. Please open the game inside Pi Browser and check your internet connection.');
+      return false;
+    }
+    if (!_initPi()) {
+      _piMsg('Pi.init failed: ' + (_piInitError || 'unknown error'));
+      return false;
+    }
+
+    // مهلة 40 ثانية حتى لا يبقى الزر معلّقاً
+    const attempt = () => Promise.race([
       Pi.authenticate(['username', 'payments'], onIncompletePaymentFound),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('Login timed out. Please try again from Pi Browser.')), 25000))
+      new Promise((_, rej) => setTimeout(() => rej(new Error('Login timed out. Please try again.')), 40000))
     ]);
+    let auth;
+    try {
+      auth = await attempt();
+    } catch (err) {
+      // "SDK was not initialized": نعيد التهيئة مرة واحدة ثم نحاول من جديد
+      if (/not initialized/i.test((err && err.message) || '')) {
+        if (!_initPi(true)) throw new Error('Pi.init failed: ' + (_piInitError || 'unknown error'));
+        auth = await attempt();
+      } else {
+        throw err;
+      }
+    }
+
     _piAccessToken = auth.accessToken;
     GS.piUser = auth.user;
-    const badge = document.getElementById('piUserBadge');
-    if (badge) { badge.textContent = 'π ' + auth.user.username; badge.style.display = 'block'; }
     loadLocal();
     await cloudLoad();
-    showScreen('splash');
-    setSplashBG();
+    _updatePiUI();
+    if (!stay) { showScreen('splash'); setSplashBG(); }
+    return true;
   } catch(e) {
     console.error('[Pi] Auth failed:', e);
-    alert('Pi login failed:\n' + ((e && (e.message || e.error)) || JSON.stringify(e)));
-    playGuest();
+    const detail = (e && (e.message || e.toString())) || 'unknown error';
+    _piMsg('Pi login failed: ' + detail + '\n(sandbox=' + _inPiSandbox() + ')');
+    if (document.getElementById('piLogin')?.classList.contains('active')) _addModeButton();
+    return false;       // لا ندخل كضيف تلقائياً — اللاعب يقرر
+  } finally {
+    _piAuthBusy = false;
+    btns.forEach(b => { b.disabled = false; b.style.opacity = ''; });
   }
+}
+
+// ── زر Open: دخول مباشر للّعبة دون تسجيل (التسجيل من الزر الجانبي في الشاشة الرئيسية) ──
+function enterGame() {
+  _updatePiUI();
+  showScreen('splash');
+  setSplashBG();
 }
 
 // ── اللعب كضيف ──
 function playGuest() {
   GS.piUser = null;
   _piAccessToken = null;
+  _updatePiUI();
   showScreen('splash');
   setSplashBG();
 }
@@ -491,8 +719,7 @@ function playGuest() {
 function logout() {
   GS.piUser = null;
   _piAccessToken = null;
-  const badge = document.getElementById('piUserBadge');
-  if (badge) badge.style.display = 'none';
+  _updatePiUI();
   showScreen('piLogin');
 }
 
@@ -521,17 +748,20 @@ async function _piCompletePayment(paymentId, txid, onSuccess) {
     if (onSuccess) onSuccess();
     return true;
   }
-  alert('⚠️ Payment received but not confirmed yet.\nReopen the game to finish it — you will not be charged twice.');
+  alert(i18n('notConf'));
   return false;
 }
 
 // ── الشراء من المتجر (Pi الحقيقي) ──
 async function buy(item, amount) {
   if (!GS.piUser) {
-    alert('🔐 Please login with Pi Network to purchase!');
-    return;
+    const ok = await piAuth({ stay: true });      // يطلب الدخول بحساب Pi ثم يكمل الشراء
+    if (!ok || !GS.piUser) return;
   }
   if (!PI_REWARDS[item]) { alert('Unknown item'); return; }
+  // لا ندفع مقابل شيء مفتوح أصلاً
+  if ((item === 'world' && !WORLDS.some(w => w.minLevel > GS.maxUnlocked)) ||
+      (item === 'level' && GS.maxUnlocked >= 100)) { alert(i18n('nothing')); return; }
 
   const paymentData = {
     amount,
@@ -547,7 +777,7 @@ async function buy(item, amount) {
     onReadyForServerCompletion: async (paymentId, txid) => {
       console.log('[Pi] onReadyForServerCompletion:', paymentId, txid);
       const ok = await _piCompletePayment(paymentId, txid, () => _applyPiReward(item));
-      if (ok) alert('✅ Purchase successful! Enjoy your ' + (PI_MEMOS[item] || item) + '!');
+      if (ok) alert(i18n('buyOk'));
     },
     onCancel: (paymentId) => {
       console.log('[Pi] Cancelled:', paymentId);
@@ -556,7 +786,7 @@ async function buy(item, amount) {
     onError: (err, payment) => {
       console.error('[Pi] Error:', err, payment);
       if (payment && payment.identifier) _piCancelPayment(payment.identifier);
-      alert('❌ Payment error. Please try again.');
+      alert(i18n('payErr'));
     },
   };
 
@@ -564,7 +794,7 @@ async function buy(item, amount) {
     Pi.createPayment(paymentData, paymentCallbacks);
   } catch(e) {
     console.error('[Pi] createPayment failed:', e);
-    alert('❌ Could not start payment. Make sure you are in Pi Browser.');
+    alert(i18n('openPi'));
   }
 }
 
@@ -610,7 +840,7 @@ function showScreen(id) {
   // إيقاف الأصوات عند الخروج من المرحلة
   const wasInGame = document.getElementById('gameScreen')?.classList.contains('active');
   const leavingGame = wasInGame && !['gameScreen','winScreen','loseScreen'].includes(id);
-  if (leavingGame) { try { SFX.stopAll(); } catch(e){} }
+  if (leavingGame) { try { SFX.stopAll(); } catch(e){} try { AMB.stop(); } catch(e){} }
 
   mains.forEach(s => { const el = document.getElementById(s); if(el) el.classList.remove('active'); });
   subs.forEach(s => { const el = document.getElementById(s); if(el) el.classList.remove('active'); });
@@ -678,10 +908,10 @@ function buildWorldGrid() {
 
     const nameEl = document.createElement('div');
     nameEl.className = 'world-name';
-    nameEl.textContent = w.name;
+    nameEl.textContent = i18n('w' + w.id);
     const progEl = document.createElement('div');
     progEl.className = 'world-prog';
-    progEl.textContent = unlocked ? `${done}/10` : 'Locked';
+    progEl.textContent = unlocked ? `${done}/10` : '🔒';
 
     card.appendChild(imgEl);
     card.appendChild(nameEl);
@@ -697,7 +927,7 @@ let selectedWorld = 1;
 function showLevelSelect(wid) {
   selectedWorld = wid;
   const w = WORLDS[wid - 1];
-  document.getElementById('lvlSelTitle').textContent = w.name.toUpperCase() + ' WORLD';
+  document.getElementById('lvlSelTitle').textContent = i18n('w' + w.id).toUpperCase();
 
   // Set background
   const bg = document.getElementById('levelBG');
@@ -758,6 +988,7 @@ function startLevel(n) {
   startTimer(ld.time);
   updHUD(); updAmmo();
   showScreen('gameScreen');
+  AMB.start(ld.theme);
 
   cancelAnimationFrame(raf);
   lastT = performance.now();
@@ -788,7 +1019,8 @@ function buildWorld(ld) {
       } else if (v === T.SPIKE) {
         pickups.push({ x:x+2, y:y+Math.round(TS*0.35), w:TS-4, h:Math.round(TS*0.65), type:'spike', done:false });
       } else if (v === T.SPRING) {
-        pickups.push({ x:x+2, y:y+Math.round(TS*0.6), w:TS-4, h:Math.round(TS*0.4), type:'spring', done:false });
+        pickups.push({ x:x+2, y:y+Math.round(TS*0.6), w:TS-4, h:Math.round(TS*0.4), type:'spring', done:false,
+                       tileX:x, tileBottom:y+TS, animT:-1, cool:0 });
       } else if (v === T.CRUMBLE) {
         const ct = { x, y, w:TS, h:TS, type:T.GND, row:r, col:c, crumble:true, crumbleT:0, crumbling:false };
         solidTiles.push(ct);
@@ -814,8 +1046,19 @@ function buildWorld(ld) {
     pickups.push({ x:ax, y:ay, w:ammoSz, h:ammoSz, type:'ammo', done:false });
   }
 
+  // Spike groups — صورة واحدة لكل مجموعة (النوع 1 أو 2 بالتناوب) + صندوق تصادم أصغر من الصورة
+  for (const sg of (ld.spikeGroups || [])) {
+    const file = (SPIKE_IMG[ld.theme] || SPIKE_IMG.nature)[(sg.v || 1) - 1];
+    const asp  = SPIKE_ASPECT[file] || 2;
+    const dw = sg.w * TS, dh = dw / asp, dx = sg.c * TS, gy = gndRow * TS;
+    const hw = dw * 0.48, hh = dh * 0.5;
+    pickups.push({ x: dx + (dw - hw) / 2, y: gy - hh, w: hw, h: hh, type:'spike', done:false,
+                   file, dx, dy: gy - dh + 3, dw, dh });
+  }
+
   // Goal flag (always visible at end)
   pickups.push({ x:goal.c*TS, y:(goal.r-1)*TS, w:TS, h:TS*2, type:'goal', done:false });
+  castle = ld.castle ? { c: ld.castle.c } : null;
 
   // Enemies - تقليل 25% + إصلاح الطيران
   const filteredEnemies = enDefs.filter((e, i) => {
@@ -893,7 +1136,10 @@ function loop(ts) {
   const rawDt = (ts - lastT) / 16.67;
   const dt = (rawDt > 5 || lastT === 0) ? 1 : Math.min(rawDt, 3);
   lastT = ts;
-  if (!paused && gameStatus === 'playing') update(dt);
+  if (!paused) {
+    if (gameStatus === 'playing') update(dt);
+    else if (gameStatus === 'winwalk') updWinWalk(dt);
+  }
   render();
   raf = requestAnimationFrame(loop);
 }
@@ -965,8 +1211,7 @@ function updPlayer(dt) {
 
   // حفظ checkpoint عند الوقوف على الأرض الصلبة (ليس فوق فجوة)
   if (player.onGnd && !player.dead) {
-    checkpoint.x = player.x;
-    checkpoint.y = player.y;
+    if (isSafeSpot()) { checkpoint.x = player.x; checkpoint.y = player.y; }
     player._gapEnabled = true; // تفعيل كشف الفجوة بعد أول لمسة للأرض
     // صوت الهبوط عند الوصول للأرض (فقط إذا كان يسقط بسرعة)
     if (player._wasAirborne && player._prevVy > 3) {
@@ -1029,6 +1274,26 @@ function updPlayer(dt) {
     const maxF = animCounts[player.state] || 10;
     player.frame = (player.frame + 1) % maxF;
   }
+}
+
+// موقع آمن للعودة: أرض دائمة (ليست بلاطة تنهار ولا حافة هوة) وبعيداً عن الأشواك
+function isSafeSpot() {
+  const ld = LEVELS[GS.curLevel];
+  if (!ld || !ld.cells) return true;
+  const fr = Math.floor((player.y + player.h + 2) / TS);
+  if (fr < 0 || fr >= ld.rows) return false;
+  const c0 = Math.floor((player.x + 6) / TS) - 1;
+  const c1 = Math.floor((player.x + player.w - 6) / TS) + 1;
+  for (let c = c0; c <= c1; c++) {
+    if (c < 0 || c >= ld.cols) return false;
+    const v = ld.cells[fr][c];
+    if (v !== T.GND && v !== T.PLT) return false;
+  }
+  const mid = player.x + player.w / 2;
+  for (const p of pickups) {
+    if (p.type === 'spike' && !p.done && Math.abs(p.x + p.w / 2 - mid) < TS * 6) return false;
+  }
+  return true;
 }
 
 function collideX(obj) {
@@ -1133,6 +1398,7 @@ function spawnBreakParticles(x, y, theme) {
 // ── CHECK PICKUPS ──
 function checkPickups() {
   if (player.dead) return;
+  for (const p of pickups) if (p.type === 'spring') { if (p.cool > 0) p.cool--; if (p.animT >= 0) p.animT++; }
 
   for (const p of pickups) {
     if (p.done) continue;
@@ -1153,9 +1419,11 @@ function checkPickups() {
       triggerWin();
       return;
     } else if (p.type === 'spike') {
-      if (!player.inv) { killPlayer('Hit a spike!'); return; }
+      if (!player.inv) { spikeDeath(); return; }
     } else if (p.type === 'spring') {
-      // Spring - bounce
+      // Spring - bounce (مع فترة تهدئة حتى لا يتكرر الصوت في كل إطار)
+      if (p.cool > 0) continue;
+      p.cool = 18; p.animT = 0;
       player.vy = JSPD * 1.4;
       player.onGnd = false;
       SFX.play('spring');
@@ -1192,7 +1460,16 @@ function hurtPlayer() {
   GS.lives = Math.max(0, GS.lives - 1); // لا تنخفض تحت الصفر أبداً
   updHUD();
   saveLocal();
-  if (GS.lives <= 0) { killPlayer('No lives left!'); }
+  if (GS.lives <= 0) { killPlayer('Out of lives!'); }
+}
+
+// موت الأشواك: يخصم قلباً ويشغّل صوت الموت (لو بقيت قلوب يعود اللاعب لآخر نقطة)
+function spikeDeath() {
+  if (player.dead) return;
+  GS.lives = Math.max(0, GS.lives - 1);
+  updHUD(); saveLocal();
+  SFX.play(GS.lives > 0 ? 'lose' : 'hurt');   // عند 0 قلوب يُشغَّل صوت الخسارة من شاشة النهاية
+  killPlayer(GS.lives > 0 ? 'Hit a spike!' : 'Out of lives!');
 }
 
 function killPlayer(reason) {
@@ -1334,13 +1611,11 @@ function updBullets(dt) {
     const br = { x: b.x - 8, y: b.y - 5, w: 16, h: 10 };
 
     let hit = false;
-    // Check ALL solid tiles - breakable ones get destroyed
+    // الطلقة تمرّ فوق الأرض والمنصات؛ تتوقف فقط عند الكتل القابلة للكسر
     for (let ti = solidTiles.length - 1; ti >= 0; ti--) {
       const t = solidTiles[ti];
-      if (overlaps(br, t)) {
-        if (t.isBreakable) {
-          breakBlock(t);
-        }
+      if (t.isBreakable && overlaps(br, t)) {
+        breakBlock(t);
         hit = true;
         break;
       }
@@ -1397,7 +1672,11 @@ function updCamera() {
   const ld = LEVELS[GS.curLevel];
   const mapW = ld.cols * TS, mapH = ld.rows * TS;
   camera.x = Math.max(0, Math.min(player.x - W * 0.35, mapW - W));
-  camera.y = 0; // اللعبة أفقية فقط — بدون تمرير عمودي
+  // بدون تمرير عمودي، إلا عند الاقتراب من القصر: ننزل الكاميرا ليظهر كاملاً
+  let ty = 0;
+  if (castle && player.x > (ld.goal.c - 16) * TS) ty = Math.min(0, ld.gndRow * TS - (H - 34));
+  camera.y += (ty - camera.y) * 0.06;
+  if (Math.abs(ty - camera.y) < 0.5) camera.y = ty;
 }
 
 // ── RENDER ──
@@ -1466,8 +1745,8 @@ function drawPits() {
   const theme    = ld.theme || 'nature';
   const bgImg    = UI_IMGS['bg_' + theme];
   const mapH     = ld.rows * TS;
-  const pitTop   = ld.gndRow * TS;
-  const pitH     = mapH - pitTop + TS * 4;
+  const pitTop   = ld.gndRow * TS - camera.y;   // يتبع الكاميرا عند نزولها قرب القصر
+  const pitH     = mapH - ld.gndRow * TS + TS * 4;
 
   const W = parseInt(canvas.style.width)  || canvas.width;
   const H = parseInt(canvas.style.height) || canvas.height;
@@ -1725,32 +2004,86 @@ function drawPickups() {
       ctx.arc(px + p.w/2, py + p.h * 0.82, 10, 0, Math.PI*2);
       ctx.fill();
     } else if (p.type === 'spike') {
-      ctx.fillStyle = '#FF1744';
-      ctx.beginPath();
-      ctx.moveTo(px, py + p.h);
-      ctx.lineTo(px + p.w/2, py);
-      ctx.lineTo(px + p.w, py + p.h);
-      ctx.closePath(); ctx.fill();
-      ctx.fillStyle = 'rgba(255,100,100,0.3)';
-      ctx.beginPath();
-      ctx.moveTo(px + p.w*0.2, py + p.h);
-      ctx.lineTo(px + p.w*0.45, py + p.h*0.3);
-      ctx.lineTo(px + p.w*0.7, py + p.h);
-      ctx.closePath(); ctx.fill();
+      const sImg = PROPS[p.file];
+      if (p.dw && imgOK(sImg)) {
+        ctx.drawImage(sImg, p.dx, p.dy, p.dw, p.dh);
+      } else {
+        // بديل برمجي إن لم تُحمَّل الصورة
+        ctx.fillStyle = '#FF1744';
+        const n = Math.max(1, Math.round((p.dw || p.w) / TS));
+        const x0 = p.dx !== undefined ? p.dx : px, tw = (p.dw || p.w) / n;
+        for (let k = 0; k < n; k++) {
+          ctx.beginPath();
+          ctx.moveTo(x0 + k * tw, p.y + p.h);
+          ctx.lineTo(x0 + k * tw + tw / 2, p.y - p.h * 0.3);
+          ctx.lineTo(x0 + (k + 1) * tw, p.y + p.h);
+          ctx.closePath(); ctx.fill();
+        }
+      }
     } else if (p.type === 'spring') {
-      ctx.fillStyle = '#4CAF50';
-      ctx.fillRect(px, py, p.w, p.h);
-      ctx.fillStyle = '#8BC34A';
-      ctx.fillRect(px + 2, py, p.w - 4, p.h/2);
+      drawSpring(p);
     } else if (p.type === 'breakable') {
       // Already rendered in drawTiles via solidTiles
     }
   }
 }
 
+// ── SPRING (صورة مخصصة + حركة انضغاط/امتداد) ──
+function drawSpring(p) {
+  let file = SPRING_REST;
+  if (p.animT >= 0) {
+    const idx = Math.floor(p.animT / 3);
+    if (idx < SPRING_FRAMES.length) file = SPRING_FRAMES[idx]; else p.animT = -1;
+  }
+  const sp = springSprite(file);
+  if (!sp) {
+    ctx.fillStyle = '#4CAF50'; ctx.fillRect(p.x, p.y, p.w, p.h);
+    ctx.fillStyle = '#8BC34A'; ctx.fillRect(p.x + 2, p.y, p.w - 4, p.h / 2);
+    return;
+  }
+  const sc = (TS * 1.15) / sp.baseW;
+  const dw = sp.bb.w * sc, dh = sp.bb.h * sc;
+  ctx.drawImage(sp.img, sp.bb.x, sp.bb.y, sp.bb.w, sp.bb.h,
+                p.tileX + TS / 2 - dw / 2, p.tileBottom - dh + 2, dw, dh);
+}
+
+// ── CASTLE ──
+// الباب بحجم الشخصية تقريباً (100px) ما دامت الشاشة تتسع، وإلا يُصغَّر ليبقى القصر كاملاً
+function castleMetrics() {
+  if (!castle) return null;
+  const ld = LEVELS[GS.curLevel];
+  const cfg = CASTLE[ld.theme] || CASTLE.nature;
+  const img = PROPS[cfg.file];
+  const H = parseInt(canvas.style.height) || canvas.height;
+  const asp = imgOK(img) ? img.naturalWidth / img.naturalHeight : 1.5;
+  const ch = Math.min(100 / cfg.doorH, H - 38);
+  const cw = ch * asp;
+  const gy = ld.gndRow * TS;
+  const doorX = castle.c * TS + TS / 2;
+  return { cfg, img, ch, cw, doorX, x: doorX - cw * cfg.doorX, y: gy + ch * cfg.base - ch, gy };
+}
+function drawCastle() {
+  const m = castleMetrics();
+  if (!m) return;
+  const W = parseInt(canvas.style.width) || canvas.width;
+  if (m.x - camera.x > W || m.x + m.cw - camera.x < 0) return;
+  if (imgOK(m.img)) {
+    ctx.drawImage(m.img, m.x, m.y, m.cw, m.ch);
+  } else {
+    // بديل برمجي بسيط
+    ctx.fillStyle = '#8D6E63'; ctx.fillRect(m.x + m.cw * 0.2, m.y + m.ch * 0.35, m.cw * 0.6, m.ch * 0.65);
+    ctx.fillStyle = '#6D4C41'; ctx.fillRect(m.x + m.cw * 0.12, m.y + m.ch * 0.2, m.cw * 0.14, m.ch * 0.8);
+    ctx.fillRect(m.x + m.cw * 0.74, m.y + m.ch * 0.2, m.cw * 0.14, m.ch * 0.8);
+    ctx.fillStyle = '#212121';
+    const dh = m.ch * m.cfg.doorH, dw = dh * 0.6;
+    ctx.fillRect(m.doorX - dw / 2, m.gy - dh, dw, dh);
+  }
+}
+
 // ── DRAW DECORATIVE OBJECTS ──
 // الديكور يُرسم في إحداثيات العالم (world coords) داخل ctx.save/translate
 function drawDecos() {
+  drawCastle();
   const decos = window._decos || [];
   const ld    = LEVELS[GS.curLevel];
   const theme = ld?.theme || 'nature';
@@ -1870,6 +2203,13 @@ function drawBullets() {
 
 // ── DRAW PLAYER ──
 function drawPlayer() {
+  if (player.alpha !== undefined && player.alpha < 1) {
+    ctx.save(); ctx.globalAlpha = Math.max(0, player.alpha);
+    _drawPlayerInner();
+    ctx.restore();
+  } else _drawPlayerInner();
+}
+function _drawPlayerInner() {
   // Invincibility blink
   if (player.inv && Math.floor(player.invT / 5) % 2 === 0) return;
 
@@ -1932,7 +2272,7 @@ function spawnHeartPopup(screenX, screenY) {
   el.className = 'heart-popup';
   el.textContent = '❤️ +1';
   el.style.left = (screenX + camera.x) + 'px';
-  el.style.top  = (screenY + camera.y) + 'px';
+  el.style.top  = (screenY - camera.y) + 'px';
   wrapper.appendChild(el);
   setTimeout(() => el.remove(), 1000);
 }
@@ -1941,7 +2281,7 @@ function spawnCoinParticle(screenX, screenY) {
   const el = document.createElement('div');
   el.className = 'coin-popup';
   el.textContent = '+50';
-  el.style.cssText = `position:absolute;left:${screenX+camera.x}px;top:${screenY+camera.y}px;color:#FFD700;font-size:16px;font-weight:900;pointer-events:none;z-index:30;animation:coinPop .8s ease-out forwards;`;
+  el.style.cssText = `position:absolute;left:${screenX+camera.x}px;top:${screenY-camera.y}px;color:#FFD700;font-size:16px;font-weight:900;pointer-events:none;z-index:30;animation:coinPop .8s ease-out forwards;`;
   wrapper.appendChild(el);
   setTimeout(() => el.remove(), 800);
 }
@@ -2031,10 +2371,67 @@ function startTimer(sec) {
 }
 
 // ── WIN / LOSE ──
+// لمس العلم: إن وُجد قصر تمشي الشخصية تلقائياً نحو الباب وتختفي أمامه، ثم تظهر شاشة الفوز
 function triggerWin() {
   if (gameStatus !== 'playing') return;
-  gameStatus = 'win';
+  if (castle) { startWinWalk(); return; }
+  finishWin(true);
+}
+
+function startWinWalk() {
+  gameStatus = 'winwalk';
   SFX.play('arrival');
+  clearInterval(timerInt);
+  try { AMB.stop(); } catch (e) {}
+  bullets = [];
+  player.inv = false; player.invT = 0;
+  player.dead = false;
+  player.alpha = 1;
+  player.fading = false;
+  keys.left = false; keys.right = false;
+}
+
+function updWinWalk(dt) {
+  const m = castleMetrics();
+  const doorX = m ? m.doorX : player.x + 400;
+  const cx = player.x + player.w / 2;
+  const spd = PSPD * 0.85;
+
+  if (cx >= doorX - 10) player.fading = true;
+  player.dir = 1;
+  player.vx = player.fading ? spd * 0.5 : spd;
+  player.state = player.onGnd ? 'run' : 'jump';
+
+  player.x += player.vx * dt;
+  collideX(player);
+  player.vy += GRAV * dt;
+  if (player.vy > MAX_VY) player.vy = MAX_VY;
+  player._prevY = player.y;
+  player.y += player.vy * dt;
+  player.onGnd = false;
+  collideY(player);
+
+  // حركة الإطارات
+  const animRates = { idle:10, run:5, jump:8 };
+  const animCounts = { idle:10, run:8, jump:10 };
+  player.ft += dt;
+  if (player.ft >= (animRates[player.state] || 10)) {
+    player.ft = 0;
+    player.frame = (player.frame + 1) % (animCounts[player.state] || 10);
+  }
+
+  if (player.fading) {
+    player.alpha -= 0.035 * dt;
+    if (player.alpha <= 0) { player.alpha = 0; finishWin(false); return; }
+  }
+  updParticles(dt);
+  updCamera();
+}
+
+function finishWin(playArrival) {
+  gameStatus = 'win';
+  try { AMB.stop(); } catch (e) {}
+  if (playArrival) SFX.play('arrival');
   SFX.play('win');
   clearInterval(timerInt);
   cancelAnimationFrame(raf);
@@ -2050,7 +2447,7 @@ function triggerWin() {
 
   const pct = lvTimer / (LEVELS[GS.curLevel].time || 120);
   document.getElementById('winStars').textContent = pct > 0.6 ? '⭐⭐⭐' : pct > 0.3 ? '⭐⭐' : '⭐';
-  document.getElementById('winScore').textContent = `Score: ${lvScore}  |  Coins: ${lvCoins}`;
+  document.getElementById('winScore').textContent = `⭐ ${lvScore}  |  🪙 ${lvCoins}`;
 
   setTimeout(() => showScreen('winScreen'), 500);
 }
@@ -2058,9 +2455,10 @@ function triggerWin() {
 function triggerLose(reason) {
   if (gameStatus === 'lose') return;
   gameStatus = 'lose';
+  AMB.stop();
   SFX.play('lose');
   clearInterval(timerInt);
-  document.getElementById('loseReason').textContent = reason || 'Try again!';
+  document.getElementById('loseReason').textContent = (reason ? i18nText(reason) : '🔁');
   setTimeout(() => {
     cancelAnimationFrame(raf);
     showScreen('loseScreen');
@@ -2088,10 +2486,10 @@ function revivePlayer() {
     const btn = document.getElementById('reviveBtn');
     if (btn) {
       btn.style.background = '#FF4444';
-      btn.querySelector('span').textContent = 'Need 100🪙!';
+      btn.querySelector('span').textContent = '🪙 100 ✖';
       setTimeout(() => {
         btn.style.background = '';
-        btn.querySelector('span').textContent = 'Revive 100🪙';
+        btn.querySelector('span').textContent = i18n('revive');
       }, 1200);
     }
     SFX.play('hurt');
@@ -2139,21 +2537,35 @@ function backToLevels() {
 // ── PAUSE ──
 function pauseGame() {
   paused = true;
+  keys.left = false; keys.right = false;   // لا يستمر اللاعب بالجري أثناء/بعد الإيقاف
+  AMB.pause();
   clearInterval(timerInt);
   document.getElementById('pauseOv').classList.add('show');
 }
 
 function resumeGame() {
   paused = false;
+  AMB.resume();
   document.getElementById('pauseOv').classList.remove('show');
-  lastT = performance.now();
-  if (player && !player.dead) { player.inv = true; player.invT = 90; }
+  lastT = 0;
+  if (player && !player.dead) { player.inv = true; player.invT = 180; }
   startTimer(lvTimer);
 }
 
 // ── SHOP ──
 function openShop() {
   shopFrom = document.querySelector('.screen.active')?.id || 'splash';
+  // عبارة المتجر: كل المعاملات تتم بعملة π-test (تُنشأ مرة واحدة)
+  if (!document.getElementById('shopTestNote')) {
+    const note = document.createElement('div');
+    note.id = 'shopTestNote';
+    note.textContent = 'All transactions are made with π-test';
+    note.style.cssText = 'text-align:center;color:#FFD700;font-size:12px;font-weight:700;margin:2px 12px 6px;opacity:.9;direction:ltr;';
+    const ttl = document.querySelector('#shopScreen .shop-ttl');
+    const box = document.querySelector('#shopScreen .shop-box');
+    if (ttl && ttl.parentNode) ttl.parentNode.insertBefore(note, ttl.nextSibling);
+    else if (box) box.insertBefore(note, box.firstChild);
+  }
   showScreen('shopScreen');
 }
 function closeShop() {
@@ -2204,47 +2616,18 @@ async function _loadLeaderboard(tab) {
   if (!body) return;
 
   // شاشة تحميل
-  body.innerHTML = '<div class="lb-loading"><div class="lb-spinner"></div><span>Loading...</span></div>';
+  body.innerHTML = '<div class="lb-loading"><div class="lb-spinner"></div><span>' + i18n('loading0') + '</span></div>';
 
   // عمود الترتيب حسب التبويب
   const orderCol = tab === 'level' ? 'max_level' : 'coins';
   const label    = tab === 'level' ? 'Level'      : 'Coins';
 
   try {
-    const res = await fetch(
-      `${SUPA_URL}/rest/v1/players?select=pi_username,max_level,coins&order=${orderCol}.desc&limit=50`,
-      { headers: { 'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}` } }
-    );
-
-    if (!res.ok) {
-      if (res.status === 404) {
-        body.innerHTML = `
-          <div class="lb-empty">
-            ⚙️ Leaderboard not set up yet.<br>
-            <small style="color:#555;font-size:10px;line-height:1.8;">
-              Run this SQL in Supabase dashboard:<br>
-              <code style="color:#FFD700;font-size:9px;">
-                CREATE TABLE players (<br>
-                &nbsp;pi_uid text PRIMARY KEY,<br>
-                &nbsp;pi_username text,<br>
-                &nbsp;max_level int DEFAULT 1,<br>
-                &nbsp;coins int DEFAULT 0,<br>
-                &nbsp;lives int DEFAULT 3,<br>
-                &nbsp;world_progress jsonb,<br>
-                &nbsp;updated_at timestamptz<br>
-                );
-              </code>
-            </small>
-          </div>`;
-      } else {
-        throw new Error('HTTP ' + res.status);
-      }
-      return;
-    }
-    const rows = await res.json();
+    const out = await _gameApi({ action: 'leaderboard', tab });
+    const rows = out.rows;
 
     if (!rows || rows.length === 0) {
-      body.innerHTML = '<div class="lb-empty">🏜️ No players yet.<br>Be the first to login with Pi!</div>';
+      body.innerHTML = '<div class="lb-empty">' + i18n('lbEmpty') + '</div>';
       return;
     }
 
@@ -2298,7 +2681,7 @@ function _renderMyRank() {
   panel.style.display = 'flex';
   document.getElementById('lbMyAvatar').textContent = GS.piUser.username.charAt(0).toUpperCase();
   document.getElementById('lbMyName').textContent   = GS.piUser.username;
-  document.getElementById('lbMyDetail').textContent = `Level ${GS.maxUnlocked} · ${GS.coins.toLocaleString()} coins`;
+  document.getElementById('lbMyDetail').textContent = `Lv ${GS.maxUnlocked} · 🪙 ${GS.coins.toLocaleString()}`;
   document.getElementById('lbMyScore').textContent  = `Lv ${GS.maxUnlocked}`;
 
   // جلب ترتيب اللاعب الحالي
@@ -2309,17 +2692,9 @@ async function _fetchMyRank() {
   if (!GS.piUser) return;
   try {
     // عدد اللاعبين الذين لديهم max_level أعلى
-    const res = await fetch(
-      `${SUPA_URL}/rest/v1/players?select=pi_username&max_level=gt.${GS.maxUnlocked}`,
-      { headers: { 'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}`,
-                   'Prefer': 'count=exact', 'Range': '0-0' } }
-    );
-    const countHeader = res.headers.get('Content-Range');
-    if (countHeader) {
-      const total = parseInt(countHeader.split('/')[1]) || 0;
-      const el = document.getElementById('lbMyRankNum');
-      if (el) el.textContent = `#${total + 1}`;
-    }
+    const out = await _gameApi({ action: 'rank', maxLevel: GS.maxUnlocked });
+    const el = document.getElementById('lbMyRankNum');
+    if (el && out && typeof out.higher === 'number') el.textContent = `#${out.higher + 1}`;
   } catch(e) {}
 }
 
@@ -2331,32 +2706,48 @@ function _saveAssetsOnDevice() {
     if (!('serviceWorker' in navigator)) return;
     const urls = Assets.log().concat(SFX.urls());
     navigator.serviceWorker.ready.then(reg => {
-      if (reg.active) reg.active.postMessage({ type: 'precache', urls });
+      if (reg.active) reg.active.postMessage({ type: 'precache', urls, version: window.ASSETS_VERSION || '' });
     }).catch(() => {});
   } catch (e) {}
 }
 
 // Pi SDK يُحمَّل بدون حجب الصفحة (إذا تأخر أو فشل لا تتوقف اللعبة)
 let _piInited = false;
-// داخل sandbox.minepi.com => sandbox:true ، وفي Pi Browser العادي => false (هوية التطبيق Testnet تُحدَّد برابط الموقع)
-// للإجبار: ?sandbox=1 أو ?sandbox=0
-function _isSandboxEnv() {
-  const q = location.search;
-  if (q.indexOf('sandbox=1') !== -1) return true;
-  if (q.indexOf('sandbox=0') !== -1) return false;
-  let anc = '';
-  try { anc = (location.ancestorOrigins && location.ancestorOrigins[0]) || document.referrer || ''; } catch(e) {}
-  let framed = false;
-  try { framed = window.self !== window.top; } catch(e) { framed = true; }
-  return anc.indexOf('sandbox.minepi.com') !== -1 || framed;
+let _piSdkPromise = null;
+
+// داخل بيئة الاختبار (sandbox.minepi.com) يجب sandbox:true. للتجربة اليدوية: أضف ?sandbox=1 أو ?sandbox=0 للرابط.
+function _inPiSandbox() {
+  try {
+    const q = new URLSearchParams(window.location.search).get('sandbox');
+    if (q === '1' || q === 'true')  return true;
+    if (q === '0' || q === 'false') return false;
+  } catch(e) {}
+  try {
+    const a = window.location.ancestorOrigins;
+    if (a && a.length) return Array.from(a).some(o => o.indexOf('sandbox.minepi.com') !== -1);
+  } catch(e) {}
+  return (document.referrer || '').indexOf('sandbox.minepi.com') !== -1;
 }
-function _initPi() {
-  if (_piInited || typeof Pi === 'undefined') return;
-  try { Pi.init({ version: '2.0', sandbox: _isSandboxEnv() }); _piInited = true; }
-  catch(e) { console.error('[Pi] init failed:', e); }
+
+let _piInitError = null;
+function _initPi(force) {
+  if (typeof Pi === 'undefined') return false;
+  if (_piInited && !force) return true;
+  try {
+    Pi.init({ version: '2.0', sandbox: _inPiSandbox() });
+    _piInited = true; _piInitError = null;
+    return true;
+  } catch(e) {
+    _piInited = false;
+    _piInitError = (e && e.message) || String(e);
+    console.error('[Pi] init failed:', e);
+    return false;
+  }
 }
+
 function _loadPiSdk() {
-  return new Promise(res => {
+  if (_piSdkPromise) return _piSdkPromise;
+  _piSdkPromise = new Promise(res => {
     if (typeof Pi !== 'undefined') { _initPi(); return res(); }
     const s = document.createElement('script');
     s.src = 'https://sdk.minepi.com/pi-sdk.js';
@@ -2364,8 +2755,9 @@ function _loadPiSdk() {
     s.onload  = () => { _initPi(); res(); };
     s.onerror = () => res();
     document.head.appendChild(s);
-    setTimeout(res, 3000);            // لا ننتظر أكثر من 3 ثوانٍ
+    setTimeout(res, 8000);            // لا ننتظر أكثر من 8 ثوانٍ
   });
+  return _piSdkPromise;
 }
 
 // Shows the list of missing REQUIRED files and waits for the player: Retry or Continue.
@@ -2388,7 +2780,7 @@ async function _boot() {
   const lbg = document.getElementById('loadBG');
 
   ldProgress(5, 'Starting...');
-  _loadPiSdk();                       // في الخلفية — لا ننتظره
+  _loadPiSdk().then(() => { try { _updateBuildInfo(); } catch(e) {} });   // في الخلفية — لا ننتظره
 
   // ── تحميل كل الأصول؛ لا تبدأ اللعبة قبل اكتمالها ──
   ldProgress(10, 'Loading assets... 0%');
@@ -2397,9 +2789,16 @@ async function _boot() {
     ldProgress(10 + pct * 0.8, 'Loading assets... ' + pct + '%');
   };
   let res = await Assets.loadAll(onProgress);
+  if (res.failed.length) {                       // محاولة ثانية تلقائية (قد يكون انقطاعاً عابراً)
+    ldProgress(10, 'Retrying...');
+    res = await Assets.loadAll(onProgress);
+  }
   while (res.failed.length) {
-    console.warn('[Assets] missing required files:', res.failed);
-    const choice = await _showLoadReport(res.failed);
+    console.warn('[Assets] missing files:', res.failed);
+    // صور البلاطات الناقصة لها بديل مرسوم برمجياً → لا نوقف اللاعب بسببها
+    const important = res.failed.filter(f => !/(^|\/)assets\/tiles\//.test(f));
+    if (!important.length) break;
+    const choice = await _showLoadReport(important);
     if (choice === 'continue') break;
     ldProgress(10, 'Retrying...');
     res = await Assets.loadAll(onProgress);
@@ -2420,6 +2819,7 @@ async function _boot() {
   await new Promise(r => setTimeout(r, 400));
 
   // الدخول عبر Pi Network (أو اللعب كضيف)
+  _updatePiUI();
   showScreen('piLogin');
   _saveAssetsOnDevice();
 }
@@ -2428,9 +2828,9 @@ else _boot();
 
 function ldProgress(p, txt) {
   const bar = document.getElementById('ldBar');
-  const t   = document.getElementById('ldTxt');
+  const el  = document.getElementById('ldTxt');
   if (bar) bar.style.width = p + '%';
-  if (t)   t.textContent = txt;
+  if (el)  el.textContent = p >= 100 ? i18n('ready') : i18n('loading', { p: Math.round(p) });
 }
 
 // ── PREVENT SCROLL / CONTEXT MENU ──
