@@ -7,6 +7,28 @@
 // ═══════════════════════════════════════════════════════
 'use strict';
 
+// ── النصوص (i18n) ──
+// كانت الدوال i18n / i18nText مستخدمة في الملف دون تعريف، فيتوقف التحميل عند 0%.
+const I18N_EN = {
+  loading:  'Loading... {p}%',
+  loading0: 'Loading...',
+  ready:    'Ready!',
+  lbEmpty:  '🏜️ No players yet.<br>Be the first to login with Pi!',
+  revive:   'Revive 100🪙',
+  notConf:  '⚠️ Payment received but not confirmed yet.\nReopen the game to finish it — you will not be charged twice.',
+  nothing:  'You already unlocked everything available!',
+  openPi:   '❌ Could not start payment. Make sure you are in Pi Browser.',
+  payErr:   '❌ Payment error. Please try again.',
+  buyOk:    '✅ Purchase successful! Enjoy!',
+  w1: 'Nature', w2: 'Graveyard', w3: 'Winter', w4: 'Desert'
+};
+function i18n(key, params) {
+  let s = (I18N_EN[key] !== undefined) ? I18N_EN[key] : String(key);
+  if (params) for (const k in params) s = s.split('{' + k + '}').join(params[k]);
+  return s;
+}
+function i18nText(t) { return t; }
+
 // ── CONSTANTS ──
 const TS     = 32;          // Tile size in px
 const GRAV   = 0.42;
@@ -2823,14 +2845,21 @@ async function _boot() {
   showScreen('piLogin');
   _saveAssetsOnDevice();
 }
-if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _boot);
-else _boot();
+function _bootSafe() {
+  _boot().catch(e => {
+    console.error('[Boot] failed:', e);
+    const t = document.getElementById('ldTxt');
+    if (t) t.textContent = '⚠️ ' + ((e && e.message) || e);
+  });
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', _bootSafe);
+else _bootSafe();
 
 function ldProgress(p, txt) {
   const bar = document.getElementById('ldBar');
   const el  = document.getElementById('ldTxt');
   if (bar) bar.style.width = p + '%';
-  if (el)  el.textContent = p >= 100 ? i18n('ready') : i18n('loading', { p: Math.round(p) });
+  if (el)  el.textContent = p >= 100 ? 'Ready!' : 'Loading... ' + Math.round(p) + '%';
 }
 
 // ── PREVENT SCROLL / CONTEXT MENU ──
